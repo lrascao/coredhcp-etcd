@@ -1,4 +1,4 @@
-module github.com/lrascao/coredhcp-etcd/etcd
+module github.com/lrascao/coredhcp-etcd
 
 go 1.19
 
@@ -7,7 +7,9 @@ require (
 	github.com/insomniacslk/dhcp v0.0.0-20221215072855-de60144f33f8
 	github.com/pkg/errors v0.9.1
 	github.com/spf13/viper v1.15.0
+	go.etcd.io/etcd/api/v3 v3.5.6
 	go.etcd.io/etcd/client/v3 v3.5.6
+	golang.org/x/sync v0.1.0
 )
 
 require (
@@ -34,14 +36,12 @@ require (
 	github.com/subosito/gotenv v1.4.2 // indirect
 	github.com/u-root/uio v0.0.0-20221213070652-c3537552635f // indirect
 	github.com/willf/bitset v1.1.11 // indirect
-	go.etcd.io/etcd/api/v3 v3.5.6 // indirect
 	go.etcd.io/etcd/client/pkg/v3 v3.5.6 // indirect
 	go.uber.org/atomic v1.9.0 // indirect
 	go.uber.org/multierr v1.8.0 // indirect
 	go.uber.org/zap v1.21.0 // indirect
 	golang.org/x/crypto v0.0.0-20220525230936-793ad666bf5e // indirect
 	golang.org/x/net v0.4.0 // indirect
-	golang.org/x/sync v0.1.0 // indirect
 	golang.org/x/sys v0.5.0 // indirect
 	golang.org/x/term v0.3.0 // indirect
 	golang.org/x/text v0.5.0 // indirect
@@ -51,3 +51,5 @@ require (
 	gopkg.in/ini.v1 v1.67.0 // indirect
 	gopkg.in/yaml.v3 v3.0.1 // indirect
 )
+
+replace github.com/coredhcp/coredhcp v0.0.0-20220602152301-a2552c5c1b7a => github.com/lrascao/coredhcp v0.0.0-20230305000251-d6d1f55956d8
