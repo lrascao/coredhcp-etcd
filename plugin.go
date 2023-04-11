@@ -110,13 +110,11 @@ func (p *PluginState) Handler4(req, resp *dhcpv4.DHCPv4) (*dhcpv4.DHCPv4, bool) 
 		// did the client request a different lease time than what
 		// we're configured with?
 		if req.IPAddressLeaseTime(leaseTime) != leaseTime {
-			log.Debugf("client requested lease time of %v, offering %v instead",
-				req.IPAddressLeaseTime(leaseTime),
-				leaseTime)
-			// turn the reply into an offer
-			resp.UpdateOption(dhcpv4.OptMessageType(dhcpv4.MessageTypeOffer))
+			log.Debugf("client requested lease time of %v, using that",
+				req.IPAddressLeaseTime(leaseTime))
+			leaseTime = req.IPAddressLeaseTime(leaseTime)
 
-			return resp, false
+			resp.UpdateOption(dhcpv4.OptIPAddressLeaseTime(leaseTime))
 		}
 
 		// lease the IP in etcd
