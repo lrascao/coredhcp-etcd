@@ -36,6 +36,8 @@ func NewClient(ctx context.Context, c Config) (*etcd.Client, error) {
 				err := client.Sync(ctx)
 				if err != nil {
 					log.Error("failed to sync etcd endpoints: %v", err)
+					// crash so systemd can restart it and hopefully recover
+					panic(err)
 				} else {
 					log.Info("synced etcd endpoint list")
 				}

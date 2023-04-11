@@ -1,25 +1,16 @@
 package etcdplugin
 
 import (
-	"bytes"
 	"context"
-	"encoding/binary"
-	"fmt"
-	"net"
-	"strings"
 	"sync"
 	"time"
 
-	"github.com/pkg/errors"
-	"github.com/spf13/viper"
 	etcd "go.etcd.io/etcd/client/v3"
 	"golang.org/x/sync/errgroup"
 
-	"github.com/coredhcp/coredhcp/handler"
 	"github.com/coredhcp/coredhcp/logger"
 	"github.com/coredhcp/coredhcp/plugins"
 	"github.com/coredhcp/coredhcp/plugins/allocators"
-	"github.com/coredhcp/coredhcp/plugins/allocators/bitmap"
 	"github.com/insomniacslk/dhcp/dhcpv4"
 )
 
@@ -29,7 +20,10 @@ var Plugin = plugins.Plugin{
 	Setup4: setup,
 }
 
-const constDefaultSeparator = "::"
+const (
+	constDefaultSeparator = "::"
+	constDefaultLeaseTime = 10 * time.Minute
+)
 
 type Config struct {
 	CA        string
@@ -40,6 +34,9 @@ type Config struct {
 	End       string
 	Prefix    string
 	Separator string
+	DNSZone   string
+	DNSPrefix string
+	DNSNames  string
 }
 
 // PluginState is the data held by an instance of the range plugin
@@ -49,6 +46,7 @@ type PluginState struct {
 	config    Config
 	client    *etcd.Client
 	allocator allocators.Allocator
+	dns       *DNS
 	grp       *errgroup.Group
 }
 
@@ -108,15 +106,35 @@ func (p *PluginState) Handler4(req, resp *dhcpv4.DHCPv4) (*dhcpv4.DHCPv4, bool) 
 			ip = req.RequestedIPAddress()
 		}
 
+		leaseTime := resp.IPAddressLeaseTime(constDefaultLeaseTime)
+		// did the client request a different lease time than what
+		// we're configured with?
+		if req.IPAddressLeaseTime(leaseTime) != leaseTime {
+			log.Debugf("client requested lease time of %v, offering %v instead",
+				req.IPAddressLeaseTime(leaseTime),
+				leaseTime)
+			// turn the reply into an offer
+			resp.UpdateOption(dhcpv4.OptMessageType(dhcpv4.MessageTypeOffer))
+
+			return resp, false
+		}
+
 		// lease the IP in etcd
-		if err := p.leaseIP(ctx, req.ClientHWAddr, ip,
-			resp.IPAddressLeaseTime(30*time.Second)); err != nil {
+		if err := p.leaseIP(ctx, req.ClientHWAddr, ip, leaseTime); err != nil {
 			log.Errorf("unable to lease nic %s, ip %s: %w", req.ClientHWAddr, ip, err)
 			return nil, true
 		}
 
 		// set ip reply
 		resp.YourIPAddr = ip
+
+		// register DNS if available
+		if hostname := req.HostName(); hostname != "" {
+			if err := p.dns.Register(ctx, p.client, hostname, ip, req.ClientHWAddr,
+				leaseTime); err != nil {
+				return nil, true
+			}
+		}
 
 		log.Infof("return requested IP %s for MAC %s", ip, req.ClientHWAddr)
 
@@ -138,66 +156,4 @@ func (p *PluginState) Handler4(req, resp *dhcpv4.DHCPv4) (*dhcpv4.DHCPv4, bool) 
 	}
 
 	return resp, false
-}
-
-func setup(args0 ...string) (handler.Handler4, error) {
-	args := strings.Join(args0, "\n")
-
-	viper.SetConfigType("properties")
-	viper.ReadConfig(bytes.NewBuffer([]byte(args)))
-
-	var config Config
-	err := viper.Unmarshal(&config)
-	if err != nil {
-		return nil, fmt.Errorf("unable to unmarshal config: %w", err)
-	}
-
-	if config.Separator == "" {
-		config.Separator = constDefaultSeparator
-	}
-
-	ctx := context.Background()
-
-	client, err := NewClient(ctx, config)
-	if err != nil {
-		return nil, err
-	}
-
-	ipStart := net.ParseIP(config.Start)
-	if ipStart.To4() == nil {
-		return nil, fmt.Errorf("invalid IPv4 address: %v", config.Start)
-	}
-	ipEnd := net.ParseIP(config.End)
-	if ipEnd.To4() == nil {
-		return nil, fmt.Errorf("invalid IPv4 address: %v", config.End)
-	}
-	if binary.BigEndian.Uint32(ipStart.To4()) >= binary.BigEndian.Uint32(ipEnd.To4()) {
-		return nil, errors.New("start of IP range has to be lower than the end of an IP range")
-	}
-
-	allocator, err := bitmap.NewIPv4Allocator(ipStart, ipEnd)
-	if err != nil {
-		return nil, fmt.Errorf("could not create an allocator: %w", err)
-	}
-
-	grp, ctx := errgroup.WithContext(ctx)
-
-	p := PluginState{
-		config:    config,
-		client:    client,
-		allocator: allocator,
-		grp:       grp,
-	}
-
-	if err := p.bootstrapLeasableRange(ctx); err != nil {
-		return nil, fmt.Errorf("unable to bootstrap leasable range: ", err)
-	}
-
-	grp.Go(func() error {
-		log.Info("starting lease monitor")
-		err := p.monitorLeases(ctx, 10*time.Second)
-		return errors.Wrap(err, "could not monitor leases")
-	})
-
-	return p.Handler4, nil
 }
