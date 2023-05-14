@@ -66,18 +66,19 @@ func (d DNS) Register(ctx context.Context, client *etcd.Client,
 		nameKey := d.prefix + d.separator +
 			d.zone + d.separator +
 			"A" + d.separator +
-			alias
+			hostname
+		// create a record that allows resolving CNAME - hostname - ip
 		cnameKey := d.prefix + d.separator +
 			d.zone + d.separator +
 			"CNAME" + d.separator +
-			hostname
+			alias
 
 		if _, err := kvc.Put(ctx, nameKey, ip.String(),
 			etcd.WithLease(lease.ID)); err != nil {
 			return errors.Wrap(err, "could not register A name")
 		}
 
-		if _, err := kvc.Put(ctx, cnameKey, alias,
+		if _, err := kvc.Put(ctx, cnameKey, hostname,
 			etcd.WithLease(lease.ID)); err != nil {
 			return errors.Wrap(err, "could not register CNAME name")
 		}
