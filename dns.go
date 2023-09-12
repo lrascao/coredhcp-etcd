@@ -56,8 +56,8 @@ func (d DNS) Register(ctx context.Context, client *etcd.Client,
 	if name, ok := d.static[mac.String()]; ok {
 		nameKey := d.prefix + d.separator +
 			d.zone + d.separator +
-			"A" + d.separator +
-			name
+			name + d.separator +
+			"A"
 
 		if _, err := kvc.Put(ctx, nameKey, ip.String()); err != nil {
 			return errors.Wrap(err, "could not register name")
@@ -65,13 +65,13 @@ func (d DNS) Register(ctx context.Context, client *etcd.Client,
 	} else if alias, ok := d.aliases[hostname]; ok {
 		nameKey := d.prefix + d.separator +
 			d.zone + d.separator +
-			"A" + d.separator +
-			hostname
+			hostname + d.separator +
+			"A"
 		// create a record that allows resolving CNAME - hostname - ip
 		cnameKey := d.prefix + d.separator +
 			d.zone + d.separator +
-			"CNAME" + d.separator +
-			alias
+			alias + d.separator +
+			"CNAME"
 
 		if _, err := kvc.Put(ctx, nameKey, ip.String(),
 			etcd.WithLease(lease.ID)); err != nil {
@@ -86,8 +86,8 @@ func (d DNS) Register(ctx context.Context, client *etcd.Client,
 		// not static, no alias, simply register
 		nameKey := d.prefix + d.separator +
 			d.zone + d.separator +
-			"A" + d.separator +
-			hostname
+			hostname + d.separator +
+			"A"
 
 		if _, err := kvc.Put(ctx, nameKey, ip.String(),
 			etcd.WithLease(lease.ID)); err != nil {
@@ -135,7 +135,7 @@ func LoadNames(filename string) (map[string]string, map[string]string, error) {
 			name := tokens[1]
 			alias := tokens[2]
 
-			aliases[alias] = name
+			aliases[name] = alias
 		}
 	}
 
