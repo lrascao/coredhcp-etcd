@@ -215,7 +215,7 @@ func (p *PluginState) leaseIP(ctx context.Context, nic net.HardwareAddr, ip net.
 	// If we did an else in the nested transaction, we failed to actually update
 	// the lease
 	if !res.Responses[0].Response.(*etcdpb.ResponseOp_ResponseTxn).ResponseTxn.Succeeded {
-		return fmt.Errorf("ip %v is no longer free", ip)
+		return fmt.Errorf("ip %+v is no longer free: %w", ip, ErrAlreadyLeased)
 	}
 
 	return nil

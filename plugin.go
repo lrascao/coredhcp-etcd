@@ -106,6 +106,12 @@ func (p *PluginState) Handler4(req, resp *dhcpv4.DHCPv4) (*dhcpv4.DHCPv4, bool) 
 		// lease the IP in etcd
 		if err := p.leaseIP(ctx, req.ClientHWAddr, ip, leaseTime); err != nil {
 			log.Errorf("unable to lease nic %s, ip %s: %w", req.ClientHWAddr, ip, err)
+			if IsAlreadyLeased(err) {
+				log.Debugf("ip %s already leased, returning negative reply to DHCP request", ip)
+				// return a negative reply
+				resp.UpdateOption(dhcpv4.OptMessageType(dhcpv4.MessageTypeNak))
+				return resp, false
+			}
 			return nil, true
 		}
 
