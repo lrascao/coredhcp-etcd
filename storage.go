@@ -130,7 +130,7 @@ func (p *PluginState) resurrectLeases(ctx context.Context) error {
 		}
 
 		if res.Succeeded {
-			log.Infof("resurrected expired %v", ip)
+			log.Infof("resurrected expired %v back to free state", ip)
 		}
 	}
 	return nil
