@@ -25,20 +25,6 @@ const (
 	constDefaultLeaseTime = 10 * time.Minute
 )
 
-type Config struct {
-	CA        string
-	Cert      string
-	Key       string
-	Endpoints []string
-	Start     string
-	End       string
-	Prefix    string
-	Separator string
-	DNSZone   string
-	DNSPrefix string
-	DNSNames  string
-}
-
 // PluginState is the data held by an instance of the range plugin
 type PluginState struct {
 	// Rough lock for the whole plugin, we'll get better performance once we use leasestorage

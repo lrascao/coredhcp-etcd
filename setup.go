@@ -23,10 +23,11 @@ func setup(args0 ...string) (handler.Handler4, error) {
 	viper.ReadConfig(bytes.NewBuffer([]byte(args)))
 
 	var config Config
-	err := viper.Unmarshal(&config)
-	if err != nil {
+	if err := viper.Unmarshal(&config); err != nil {
 		return nil, fmt.Errorf("unable to unmarshal config: %w", err)
 	}
+
+	log.Infof("%s", config)
 
 	if config.Separator == "" {
 		config.Separator = constDefaultSeparator

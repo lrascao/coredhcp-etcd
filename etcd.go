@@ -55,17 +55,23 @@ func NewClient(ctx context.Context, c Config) (*etcd.Client, error) {
 
 func etcdConfig(c Config) (etcd.Config, error) {
 	caCertPool := x509.NewCertPool()
-	caCert, err := ioutil.ReadFile(c.CA)
-	if err != nil {
-		return etcd.Config{}, errors.Wrap(err, "could not load etcd CA")
-	}
-	caCertPool.AppendCertsFromPEM(caCert)
 
-	cert, err := tls.LoadX509KeyPair(c.Cert, c.Key)
-	if err != nil {
-		return etcd.Config{}, errors.Wrap(err, "could not load etcd client key pair")
+	if c.CA != "" {
+		caCert, err := ioutil.ReadFile(c.CA)
+		if err != nil {
+			return etcd.Config{}, errors.Wrap(err, "could not load etcd CA")
+		}
+		caCertPool.AppendCertsFromPEM(caCert)
 	}
-	certificates := []tls.Certificate{cert}
+
+	var certificates []tls.Certificate
+	if c.Cert != "" && c.Key != "" {
+		cert, err := tls.LoadX509KeyPair(c.Cert, c.Key)
+		if err != nil {
+			return etcd.Config{}, errors.Wrap(err, "could not load etcd client key pair")
+		}
+		certificates = []tls.Certificate{cert}
+	}
 
 	return etcd.Config{
 		Endpoints: c.Endpoints,
