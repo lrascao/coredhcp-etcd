@@ -52,6 +52,11 @@ func (p *PluginState) Handler4(req, resp *dhcpv4.DHCPv4) (*dhcpv4.DHCPv4, bool) 
 	log.Debugf("got DHCPv4 packet %v", req.MessageType())
 	log.Debugf("%v", req.Summary())
 
+	defer func() {
+		log.Debugf("replying with DHCPv4 packet: %v", resp.MessageType())
+		log.Debugf("%v", resp.Summary())
+	}()
+
 	switch req.MessageType() {
 	case dhcpv4.MessageTypeDiscover:
 		ip, err := p.nicLeasedIP(ctx, req.ClientHWAddr)
