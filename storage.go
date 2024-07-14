@@ -255,6 +255,9 @@ func (p *PluginState) revokeLease(ctx context.Context, nic net.HardwareAddr) err
 	if err != nil {
 		return errors.Wrap(err, "could not get nic's current lease")
 	}
+	if len(res.Kvs) == 0 {
+		return fmt.Errorf("nic %v has no lease", nic)
+	}
 
 	ip := string(res.Kvs[0].Value)
 

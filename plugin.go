@@ -137,7 +137,7 @@ func (p *PluginState) Handler4(req, resp *dhcpv4.DHCPv4) (*dhcpv4.DHCPv4, bool) 
 		}
 
 		if err := p.revokeLease(ctx, req.ClientHWAddr); err != nil {
-			log.Errorf("unable to revoke lease nic %s: %w", req.ClientHWAddr, err)
+			log.Errorf("error revoking lease for nic %s: %v", req.ClientHWAddr, err)
 			return nil, true
 		}
 
