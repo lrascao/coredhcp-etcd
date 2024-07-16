@@ -83,9 +83,17 @@ func (p *PluginState) Handler4(req, resp *dhcpv4.DHCPv4) (*dhcpv4.DHCPv4, bool) 
 		log.Infof("returning IP %s for MAC %s", resp.YourIPAddr, req.ClientHWAddr.String())
 
 	case dhcpv4.MessageTypeRequest:
-		// is the message meant for this server?
 		reqServerIP := req.ServerIdentifier()
-		if reqServerIP != nil && !reqServerIP.Equal(resp.ServerIPAddr) {
+
+		// deny REQUESTs without a server identifier
+		if reqServerIP == nil {
+			log.Errorf("no server identifier in DHCP request, returning negative reply")
+			resp.UpdateOption(dhcpv4.OptMessageType(dhcpv4.MessageTypeNak))
+			return resp, false
+		}
+
+		// is the message meant for this server?
+		if !reqServerIP.Equal(resp.ServerIPAddr) {
 			// ignore
 			log.Debugf("ignoring DHCP request meant for %s", reqServerIP)
 			return nil, true
