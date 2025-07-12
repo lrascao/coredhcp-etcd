@@ -11,6 +11,7 @@ import (
 
 	"github.com/coredhcp/coredhcp/handler"
 	"github.com/coredhcp/coredhcp/plugins/allocators/bitmap"
+	"github.com/go-viper/encoding/javaproperties"
 	"github.com/pkg/errors"
 	"github.com/spf13/viper"
 	"golang.org/x/sync/errgroup"
@@ -19,8 +20,14 @@ import (
 func setup(args0 ...string) (handler.Handler4, error) {
 	args := strings.Join(args0, "\n")
 
-	v := viper.New()
-	v.SetConfigType("env")
+	codecRegistry := viper.NewCodecRegistry()
+	codec := &javaproperties.Codec{}
+	codecRegistry.RegisterCodec("properties", codec)
+
+	v := viper.NewWithOptions(
+		viper.WithCodecRegistry(codecRegistry),
+	)
+	v.SetConfigType("properties")
 	if err := v.ReadConfig(bytes.NewBuffer([]byte(args))); err != nil {
 		return nil, fmt.Errorf("unable to read config: %w", err)
 	}
@@ -30,7 +37,7 @@ func setup(args0 ...string) (handler.Handler4, error) {
 		return nil, fmt.Errorf("unable to unmarshal config: %w", err)
 	}
 
-	log.Debugf("cfg: %s", config)
+	log.Infof("%s", config)
 
 	if config.Separator == "" {
 		config.Separator = constDefaultSeparator
