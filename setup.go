@@ -42,6 +42,16 @@ func setup(args0 ...string) (handler.Handler4, error) {
 	if config.Separator == "" {
 		config.Separator = constDefaultSeparator
 	}
+	if config.MinLeaseTime == 0 {
+		config.MinLeaseTime = constDefaultMinLeaseTime
+	}
+	if config.MaxLeaseTime == 0 {
+		config.MaxLeaseTime = constDefaultMaxLeaseTime
+	}
+	if config.MinLeaseTime > config.MaxLeaseTime {
+		return nil, fmt.Errorf("minleasetime %v cannot be greater than maxleasetime %v",
+			config.MinLeaseTime, config.MaxLeaseTime)
+	}
 
 	ctx := context.Background()
 
@@ -83,7 +93,7 @@ func setup(args0 ...string) (handler.Handler4, error) {
 	}
 
 	if err := p.bootstrapLeasableRange(ctx); err != nil {
-		return nil, fmt.Errorf("unable to bootstrap leasable range: ", err)
+		return nil, fmt.Errorf("unable to bootstrap leasable range: %w", err)
 	}
 
 	grp.Go(func() error {

@@ -7,7 +7,6 @@ import (
 	"io/ioutil"
 	"net"
 	"strings"
-	"time"
 
 	"github.com/pkg/errors"
 	etcd "go.etcd.io/etcd/client/v3"
@@ -40,17 +39,14 @@ func NewDNS(prefix, zone, separator, namesFile string) (*DNS, error) {
 	return dns, nil
 }
 
+// Register writes the DNS records for a freshly leased address. The records are
+// attached to leaseID, the same etcd lease that holds the address itself, so
+// that they expire with it and are torn down with it on release.
 func (d DNS) Register(ctx context.Context, client *etcd.Client,
 	hostname string, ip net.IP,
 	mac net.HardwareAddr,
-	ttl time.Duration) error {
+	leaseID etcd.LeaseID) error {
 	kvc := etcd.NewKV(client)
-
-	lease, err := etcd.NewLease(client).
-		Grant(ctx, int64(ttl.Seconds()))
-	if err != nil {
-		return errors.Wrap(err, "could not create new lease")
-	}
 
 	// is this a static entry?
 	if name, ok := d.static[mac.String()]; ok {
@@ -74,12 +70,12 @@ func (d DNS) Register(ctx context.Context, client *etcd.Client,
 			"CNAME"
 
 		if _, err := kvc.Put(ctx, nameKey, ip.String(),
-			etcd.WithLease(lease.ID)); err != nil {
+			etcd.WithLease(leaseID)); err != nil {
 			return errors.Wrap(err, "could not register A name")
 		}
 
 		if _, err := kvc.Put(ctx, cnameKey, hostname,
-			etcd.WithLease(lease.ID)); err != nil {
+			etcd.WithLease(leaseID)); err != nil {
 			return errors.Wrap(err, "could not register CNAME name")
 		}
 	} else {
@@ -90,7 +86,7 @@ func (d DNS) Register(ctx context.Context, client *etcd.Client,
 			"A"
 
 		if _, err := kvc.Put(ctx, nameKey, ip.String(),
-			etcd.WithLease(lease.ID)); err != nil {
+			etcd.WithLease(leaseID)); err != nil {
 			return errors.Wrap(err, "could not register A name")
 		}
 	}

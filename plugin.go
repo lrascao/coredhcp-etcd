@@ -21,8 +21,10 @@ var Plugin = plugins.Plugin{
 }
 
 const (
-	constDefaultSeparator = "::"
-	constDefaultLeaseTime = 10 * time.Minute
+	constDefaultSeparator    = "::"
+	constDefaultLeaseTime    = 10 * time.Minute
+	constDefaultMinLeaseTime = 1 * time.Minute
+	constDefaultMaxLeaseTime = 24 * time.Hour
 )
 
 // PluginState is the data held by an instance of the range plugin
@@ -61,7 +63,7 @@ func (p *PluginState) Handler4(req, resp *dhcpv4.DHCPv4) (*dhcpv4.DHCPv4, bool) 
 	case dhcpv4.MessageTypeDiscover:
 		ip, err := p.nicLeasedIP(ctx, req.ClientHWAddr)
 		if err != nil {
-			log.Errorf("unable to allocate IP for MAC %s: %w", req.ClientHWAddr.String(), err)
+			log.Errorf("unable to allocate IP for MAC %s: %v", req.ClientHWAddr.String(), err)
 			return nil, true
 		}
 		if ip != nil {
@@ -73,7 +75,7 @@ func (p *PluginState) Handler4(req, resp *dhcpv4.DHCPv4) (*dhcpv4.DHCPv4, bool) 
 		// fetch a free ip
 		ip, err = p.freeIP(ctx)
 		if err != nil {
-			log.Errorf("unable to fetch free IP: %w", err)
+			log.Errorf("unable to fetch free IP: %v", err)
 			return nil, true
 		}
 
@@ -108,17 +110,28 @@ func (p *PluginState) Handler4(req, resp *dhcpv4.DHCPv4) (*dhcpv4.DHCPv4, bool) 
 		leaseTime := resp.IPAddressLeaseTime(constDefaultLeaseTime)
 		// did the client request a different lease time than what
 		// we're configured with?
-		if req.IPAddressLeaseTime(leaseTime) != leaseTime {
-			log.Debugf("client requested lease time of %v, using that",
-				req.IPAddressLeaseTime(leaseTime))
-			leaseTime = req.IPAddressLeaseTime(leaseTime)
+		if requested := req.IPAddressLeaseTime(leaseTime); requested != leaseTime {
+			log.Debugf("client requested lease time of %v, using that", requested)
+			leaseTime = requested
+		}
 
+		// a client can ask for anything it likes, including a lease that
+		// outlives the pool, so bound it before we act on it
+		if clamped := p.config.clampLeaseTime(leaseTime); clamped != leaseTime {
+			log.Debugf("clamping requested lease time %v to %v", leaseTime, clamped)
+			leaseTime = clamped
+		}
+
+		// whatever we ended up with is what we're going to hold in etcd, so
+		// it's what the reply has to advertise
+		if resp.IPAddressLeaseTime(constDefaultLeaseTime) != leaseTime {
 			resp.UpdateOption(dhcpv4.OptIPAddressLeaseTime(leaseTime))
 		}
 
 		// lease the IP in etcd
-		if err := p.leaseIP(ctx, req.ClientHWAddr, ip, leaseTime); err != nil {
-			log.Errorf("unable to lease nic %s, ip %s: %w", req.ClientHWAddr, ip, err)
+		leaseID, err := p.leaseIP(ctx, req.ClientHWAddr, ip, leaseTime)
+		if err != nil {
+			log.Errorf("unable to lease nic %s, ip %s: %v", req.ClientHWAddr, ip, err)
 			if IsAlreadyLeased(err) {
 				log.Debugf("ip %s already leased, returning negative reply to DHCP request", ip)
 				// return a negative reply
@@ -131,17 +144,19 @@ func (p *PluginState) Handler4(req, resp *dhcpv4.DHCPv4) (*dhcpv4.DHCPv4, bool) 
 		// set ip reply
 		resp.YourIPAddr = ip
 
-		// register DNS if available
+		// register DNS if available, on the same etcd lease as the address so
+		// that the records live and die with it
 		if hostname := req.HostName(); hostname != "" {
 			if err := p.dns.Register(ctx, p.client, hostname, ip, req.ClientHWAddr,
-				leaseTime); err != nil {
+				leaseID); err != nil {
+				log.Errorf("unable to register DNS name %s for ip %s: %v", hostname, ip, err)
 				return nil, true
 			}
 		}
 
 		log.Infof("return requested IP %s for MAC %s", ip, req.ClientHWAddr)
 
-	case dhcpv4.MessageTypeRelease, dhcpv4.MessageTypeDecline:
+	case dhcpv4.MessageTypeRelease:
 		// is the message meant for this server?
 		if !req.ServerIdentifier().Equal(resp.ServerIPAddr) {
 			// ignore
@@ -149,8 +164,39 @@ func (p *PluginState) Handler4(req, resp *dhcpv4.DHCPv4) (*dhcpv4.DHCPv4, bool) 
 			return nil, true
 		}
 
-		if err := p.revokeLease(ctx, req.ClientHWAddr); err != nil {
-			log.Errorf("error revoking lease for nic %s: %v", req.ClientHWAddr, err)
+		// RFC 2131 has the released address in ciaddr, only give up a lease the
+		// client can name rather than whatever this nic happens to hold
+		ip := req.ClientIPAddr
+		if ip == nil || ip.IsUnspecified() {
+			log.Errorf("ignoring DHCP release from %s without a client IP address",
+				req.ClientHWAddr)
+			return nil, true
+		}
+
+		if err := p.revokeLease(ctx, req.ClientHWAddr, ip); err != nil {
+			log.Errorf("error revoking lease for nic %s, ip %s: %v", req.ClientHWAddr, ip, err)
+			return nil, true
+		}
+
+	case dhcpv4.MessageTypeDecline:
+		// is the message meant for this server?
+		if !req.ServerIdentifier().Equal(resp.ServerIPAddr) {
+			// ignore
+			log.Debugf("ignoring DHCP decline meant for %s", req.ServerIdentifier())
+			return nil, true
+		}
+
+		// RFC 2131 has the declined address in the requested IP option, ciaddr
+		// is zero for a DECLINE
+		ip := req.RequestedIPAddress()
+		if ip == nil || ip.IsUnspecified() {
+			log.Errorf("ignoring DHCP decline from %s without a requested IP address",
+				req.ClientHWAddr)
+			return nil, true
+		}
+
+		if err := p.revokeLease(ctx, req.ClientHWAddr, ip); err != nil {
+			log.Errorf("error revoking lease for nic %s, ip %s: %v", req.ClientHWAddr, ip, err)
 			return nil, true
 		}
 

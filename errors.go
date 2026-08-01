@@ -2,8 +2,11 @@ package etcdplugin
 
 import "github.com/pkg/errors"
 
-var ErrAlreadyLeased = errors.New("already leased")
+var (
+	ErrAlreadyLeased = errors.New("already leased")
+	ErrNotLeased     = errors.New("not leased")
+)
 
 func IsAlreadyLeased(err error) bool {
-	return errors.As(err, &ErrAlreadyLeased)
+	return errors.Is(err, ErrAlreadyLeased)
 }

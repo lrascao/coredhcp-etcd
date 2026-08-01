@@ -1,6 +1,9 @@
 package etcdplugin
 
-import "fmt"
+import (
+	"fmt"
+	"time"
+)
 
 type Config struct {
 	CA        string
@@ -14,9 +17,25 @@ type Config struct {
 	DNSZone   string
 	DNSPrefix string
 	DNSNames  string
+	// bounds on the lease time we're willing to hand out, a client is free to
+	// ask for anything at all and we're the ones that have to honour it
+	MinLeaseTime time.Duration
+	MaxLeaseTime time.Duration
+}
+
+// clampLeaseTime bounds a lease time to the configured range
+func (c Config) clampLeaseTime(d time.Duration) time.Duration {
+	if d < c.MinLeaseTime {
+		return c.MinLeaseTime
+	}
+	if d > c.MaxLeaseTime {
+		return c.MaxLeaseTime
+	}
+	return d
 }
 
 func (c Config) String() string {
-	return fmt.Sprintf("CA=%s Cert=%s Key=%s Endpoints=%v Start=%s End=%s Prefix=%s Separator=%s DNSZone=%s DNSPrefix=%s DNSNames=%s",
-		c.CA, c.Cert, c.Key, c.Endpoints, c.Start, c.End, c.Prefix, c.Separator, c.DNSZone, c.DNSPrefix, c.DNSNames)
+	return fmt.Sprintf("CA=%s Cert=%s Key=%s Endpoints=%v Start=%s End=%s Prefix=%s Separator=%s DNSZone=%s DNSPrefix=%s DNSNames=%s MinLeaseTime=%s MaxLeaseTime=%s",
+		c.CA, c.Cert, c.Key, c.Endpoints, c.Start, c.End, c.Prefix, c.Separator, c.DNSZone, c.DNSPrefix, c.DNSNames,
+		c.MinLeaseTime, c.MaxLeaseTime)
 }

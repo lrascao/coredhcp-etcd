@@ -159,14 +159,37 @@ func (p *PluginState) nicLeasedIP(ctx context.Context, nic net.HardwareAddr) (ne
 	return ip, nil
 }
 
-func (p *PluginState) leaseIP(ctx context.Context, nic net.HardwareAddr, ip net.IP, ttl time.Duration) error {
+// leaseIP associates nic with ip for ttl, either by taking the ip out of the
+// free pool or by renewing an association that already exists. It returns the
+// etcd lease the association is attached to, so that callers can hang related
+// records off the same lifetime.
+func (p *PluginState) leaseIP(ctx context.Context, nic net.HardwareAddr, ip net.IP, ttl time.Duration) (etcd.LeaseID, error) {
 	kvc := etcd.NewKV(p.client)
+	lessor := etcd.NewLease(p.client)
 
-	lease, err := etcd.NewLease(p.client).
-		Grant(ctx, int64(ttl.Seconds()))
+	lease, err := lessor.Grant(ctx, int64(ttl.Seconds()))
 	if err != nil {
-		return errors.Wrap(err, "could not create new lease")
+		return 0, errors.Wrap(err, "could not create new lease")
 	}
+
+	// The lease is granted before we know whether we get to use it. Hand it
+	// back on every path that doesn't end up attaching a key to it, otherwise a
+	// client asking for addresses it can't have leaks one etcd lease per packet.
+	attached := false
+	defer func() {
+		if attached {
+			return
+		}
+
+		// the caller's context may already have expired, we still want the
+		// lease back
+		ctx, cancel := context.WithTimeout(context.WithoutCancel(ctx), time.Second)
+		defer cancel()
+
+		if _, err := lessor.Revoke(ctx, lease.ID); err != nil {
+			log.Debugf("could not revoke unused lease %d: %v", lease.ID, err)
+		}
+	}()
 
 	freeIPKey := p.config.Prefix + p.config.Separator +
 		"ips" + p.config.Separator +
@@ -209,16 +232,18 @@ func (p *PluginState) leaseIP(ctx context.Context, nic net.HardwareAddr, ip net.
 		}, nil),
 	).Commit()
 	if err != nil {
-		return errors.Wrap(err, "could not update for leased ip")
+		return 0, errors.Wrap(err, "could not update for leased ip")
 	}
 
 	// If we did an else in the nested transaction, we failed to actually update
 	// the lease
 	if !res.Responses[0].Response.(*etcdpb.ResponseOp_ResponseTxn).ResponseTxn.Succeeded {
-		return fmt.Errorf("ip %+v is no longer free: %w", ip, ErrAlreadyLeased)
+		return 0, fmt.Errorf("ip %+v is no longer free: %w", ip, ErrAlreadyLeased)
 	}
 
-	return nil
+	attached = true
+
+	return lease.ID, nil
 }
 
 func (p *PluginState) freeIP(ctx context.Context) (net.IP, error) {
@@ -228,8 +253,11 @@ func (p *PluginState) freeIP(ctx context.Context) (net.IP, error) {
 		"ips" + p.config.Separator +
 		"free" + p.config.Separator
 
+	// we only ever look at the first key, ask etcd for just that one instead of
+	// dragging the whole free pool over the wire on every DISCOVER
 	resp, err := kvc.Get(ctx, prefix, etcd.WithPrefix(),
-		etcd.WithSort(etcd.SortByKey, etcd.SortAscend))
+		etcd.WithSort(etcd.SortByKey, etcd.SortAscend),
+		etcd.WithLimit(1))
 	if err != nil {
 		return nil, errors.Wrap(err, "could not get etcd key")
 	}
@@ -243,44 +271,59 @@ func (p *PluginState) freeIP(ctx context.Context) (net.IP, error) {
 	return ip, nil
 }
 
-func (p *PluginState) revokeLease(ctx context.Context, nic net.HardwareAddr) error {
+// revokeLease returns ip to the free pool, but only if nic actually holds it.
+// The caller is expected to pass the address the client named itself rather
+// than whatever the nic happens to be holding, so that a client can only ever
+// give up a lease it can identify.
+func (p *PluginState) revokeLease(ctx context.Context, nic net.HardwareAddr, ip net.IP) error {
 	kvc := etcd.NewKV(p.client)
 
 	leasedNicKey := p.config.Prefix + p.config.Separator +
 		"nics" + p.config.Separator +
 		"leased" + p.config.Separator +
 		nic.String()
-
-	res, err := kvc.Get(ctx, leasedNicKey)
-	if err != nil {
-		return errors.Wrap(err, "could not get nic's current lease")
-	}
-	if len(res.Kvs) == 0 {
-		return fmt.Errorf("nic %v has no lease", nic)
-	}
-
-	ip := string(res.Kvs[0].Value)
-
 	leasedIPKey := p.config.Prefix + p.config.Separator +
 		"ips" + p.config.Separator +
 		"leased" + p.config.Separator +
-		ip
+		ip.String()
 	freeIPKey := p.config.Prefix + p.config.Separator +
 		"ips" + p.config.Separator +
 		"free" + p.config.Separator +
-		ip
+		ip.String()
 
 	txres, err := kvc.Txn(ctx).If(
-		etcdutil.KeyExists(leasedIPKey),
-		etcdutil.KeyExists(leasedNicKey),
+		// both halves of the association have to point at each other, a missing
+		// key compares as empty and fails here just the same
+		etcd.Compare(etcd.Value(leasedNicKey), "=", ip.String()),
+		etcd.Compare(etcd.Value(leasedIPKey), "=", nic.String()),
 	).Then(
+		// read the etcd lease id back before the deletes take it away with them
+		etcd.OpGet(leasedNicKey),
 		etcd.OpDelete(leasedIPKey),
 		etcd.OpDelete(leasedNicKey),
-		etcd.OpPut(freeIPKey, ip),
+		etcd.OpPut(freeIPKey, ip.String()),
 	).Commit()
+	if err != nil {
+		return errors.Wrap(err, "could not delete lease")
+	}
 
 	if !txres.Succeeded {
-		return errors.Wrap(err, "could not delete lease")
+		return fmt.Errorf("nic %v does not hold a lease on %v: %w", nic, ip, ErrNotLeased)
+	}
+
+	// Whatever else was hanging off the same etcd lease (the DNS records) has to
+	// go with it, the address is in the free pool now and the next client to get
+	// it would otherwise inherit the previous tenant's name.
+	kvs := txres.Responses[0].GetResponseRange().Kvs
+	if len(kvs) == 0 || kvs[0].Lease == 0 {
+		return nil
+	}
+
+	if _, err := etcd.NewLease(p.client).Revoke(ctx, etcd.LeaseID(kvs[0].Lease)); err != nil {
+		// the address is already back in the pool, and the records still go away
+		// on their own once the etcd lease times out
+		log.Errorf("could not revoke etcd lease %d of released ip %v, records linger until it expires: %v",
+			kvs[0].Lease, ip, err)
 	}
 
 	return nil
