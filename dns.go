@@ -48,6 +48,19 @@ func (d DNS) Register(ctx context.Context, client *etcd.Client,
 	leaseID etcd.LeaseID) error {
 	kvc := etcd.NewKV(client)
 
+	// Keys are lowercased because the reader lowercases what it looks up:
+	// coredns-etcd 3f6a5d2a/c29f1bc5 normalise the qname before building the
+	// etcd key, which is correct -- DNS is case-insensitive and a resolver may
+	// normalise. Writing the hostname as the client supplied it therefore
+	// strands every record whose name carries an uppercase letter: the key
+	// exists and can never be looked up. That is not hypothetical, it is what
+	// happened here -- 17 of 22 leases were unreachable while sitting in etcd
+	// in plain sight.
+	//
+	// The two halves are one format and nothing checks that they agree, so if
+	// the reader's normalisation ever changes, this has to change with it.
+	hostname = strings.ToLower(hostname)
+
 	// is this a static entry?
 	if name, ok := d.static[mac.String()]; ok {
 		nameKey := d.prefix + d.separator +
@@ -118,9 +131,14 @@ func LoadNames(filename string) (map[string]string, map[string]string, error) {
 		if len(tokens) != 3 {
 			return nil, nil, fmt.Errorf("malformed line, want 3 fields, got %d: %s", len(tokens), line)
 		}
+		// Lowercased for the same reason Register lowercases the hostname:
+		// these names end up in etcd keys, and the reader only ever looks up
+		// the lowercase form. The alias map is keyed on the DHCP-supplied
+		// hostname, which Register has lowercased by the time it looks in
+		// here, so the key must be lowercase too or no alias ever matches.
 		switch tokens[0] {
 		case "static":
-			name := tokens[1]
+			name := strings.ToLower(tokens[1])
 			hwaddr, err := net.ParseMAC(tokens[2])
 			if err != nil {
 				return nil, nil, fmt.Errorf("malformed hardware address: %s", tokens[2])
@@ -128,8 +146,8 @@ func LoadNames(filename string) (map[string]string, map[string]string, error) {
 
 			static[hwaddr.String()] = name
 		case "alias":
-			name := tokens[1]
-			alias := tokens[2]
+			name := strings.ToLower(tokens[1])
+			alias := strings.ToLower(tokens[2])
 
 			aliases[name] = alias
 		}

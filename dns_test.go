@@ -48,6 +48,33 @@ static nas AA-BB-CC-DD-EE-02
 	}
 }
 
+// Names become etcd keys, and the reader (coredns-etcd, since 3f6a5d2a) only
+// ever looks up the lowercase form. A name stored with any uppercase in it is
+// therefore a record that exists and can never be resolved -- which is exactly
+// how 17 of 22 leases went dark here while sitting in etcd in plain sight.
+func TestLoadNamesLowercasesNames(t *testing.T) {
+	path := writeNames(t, `static S380HB aa:bb:cc:dd:ee:03
+alias EVCS EVCS-HQ26026HJMQ
+`)
+
+	static, aliases, err := LoadNames(path)
+	if err != nil {
+		t.Fatalf("could not load names: %v", err)
+	}
+
+	if got := static["aa:bb:cc:dd:ee:03"]; got != "s380hb" {
+		t.Errorf("static name not lowercased: got %q, want s380hb", got)
+	}
+	// The alias map is keyed on the DHCP-supplied hostname, which Register
+	// lowercases before looking in here -- so an uppercase key never matches.
+	if got := aliases["evcs"]; got != "evcs-hq26026hjmq" {
+		t.Errorf("alias not lowercased: aliases[evcs] = %q, want evcs-hq26026hjmq", got)
+	}
+	if _, ok := aliases["EVCS"]; ok {
+		t.Error("alias retained its uppercase key, which Register can never match")
+	}
+}
+
 func TestLoadNamesRejectsMalformedInput(t *testing.T) {
 	for name, body := range map[string]string{
 		"too few fields":    "static printer\n",
