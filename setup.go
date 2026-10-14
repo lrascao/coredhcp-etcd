@@ -48,6 +48,9 @@ func setup(args0 ...string) (handler.Handler4, error) {
 	if config.MaxLeaseTime == 0 {
 		config.MaxLeaseTime = constDefaultMaxLeaseTime
 	}
+	if config.ReleaseGrace == 0 {
+		config.ReleaseGrace = constDefaultReleaseGrace
+	}
 	if config.MinLeaseTime > config.MaxLeaseTime {
 		return nil, fmt.Errorf("minleasetime %v cannot be greater than maxleasetime %v",
 			config.MinLeaseTime, config.MaxLeaseTime)
