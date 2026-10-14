@@ -25,6 +25,12 @@ const (
 	constDefaultLeaseTime    = 10 * time.Minute
 	constDefaultMinLeaseTime = 1 * time.Minute
 	constDefaultMaxLeaseTime = 24 * time.Hour
+	// Every leftover RELEASE seen in production (18 of them from one Shelly
+	// over 4.5 days) arrived within a second of the grant it destroyed. A
+	// genuine release this soon after a grant costs nothing to ignore -- the
+	// address stays with the same client until it expires -- so the margin is
+	// deliberately wide.
+	constDefaultReleaseGrace = 30 * time.Second
 )
 
 // PluginState is the data held by an instance of the range plugin
@@ -128,8 +134,8 @@ func (p *PluginState) Handler4(req, resp *dhcpv4.DHCPv4) (*dhcpv4.DHCPv4, bool) 
 			resp.UpdateOption(dhcpv4.OptIPAddressLeaseTime(leaseTime))
 		}
 
-		// lease the IP in etcd
-		leaseID, err := p.leaseIP(ctx, req.ClientHWAddr, ip, leaseTime)
+		// lease the IP in etcd, as granted by this server
+		leaseID, err := p.leaseIP(ctx, req.ClientHWAddr, ip, leaseTime, resp.ServerIPAddr)
 		if err != nil {
 			log.Errorf("unable to lease nic %s, ip %s: %v", req.ClientHWAddr, ip, err)
 			if IsAlreadyLeased(err) {
@@ -173,10 +179,17 @@ func (p *PluginState) Handler4(req, resp *dhcpv4.DHCPv4) (*dhcpv4.DHCPv4, bool) 
 			return nil, true
 		}
 
-		if err := p.revokeLease(ctx, req.ClientHWAddr, ip); err != nil {
+		if err := p.releaseLease(ctx, req.ClientHWAddr, ip, resp.ServerIPAddr); err != nil {
+			if IsStaleRelease(err) {
+				log.Infof("ignoring stale DHCP release from %s, it predates the lease it names: %v",
+					req.ClientHWAddr, err)
+				return nil, true
+			}
 			log.Errorf("error revoking lease for nic %s, ip %s: %v", req.ClientHWAddr, ip, err)
 			return nil, true
 		}
+
+		log.Infof("released %s from %s", ip, req.ClientHWAddr)
 
 	case dhcpv4.MessageTypeDecline:
 		// is the message meant for this server?
@@ -195,10 +208,14 @@ func (p *PluginState) Handler4(req, resp *dhcpv4.DHCPv4) (*dhcpv4.DHCPv4, bool) 
 			return nil, true
 		}
 
+		// no grant checks here: a DECLINE is the client's verdict on the lease
+		// it was just granted, so arriving right after the grant is the norm
 		if err := p.revokeLease(ctx, req.ClientHWAddr, ip); err != nil {
 			log.Errorf("error revoking lease for nic %s, ip %s: %v", req.ClientHWAddr, ip, err)
 			return nil, true
 		}
+
+		log.Infof("%s declined %s, returned it to the free pool", req.ClientHWAddr, ip)
 
 	default:
 		log.Errorf("unhandled DHCPv4 packet %v (%s): ", req.MessageType(), req.Summary())

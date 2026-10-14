@@ -2,6 +2,7 @@ package etcdplugin
 
 import (
 	"context"
+	"encoding/json"
 	"fmt"
 	"net"
 	neturl "net/url"
@@ -93,6 +94,7 @@ func newTestPlugin(t *testing.T, start, end string) *PluginState {
 			Separator:    constDefaultSeparator,
 			MinLeaseTime: constDefaultMinLeaseTime,
 			MaxLeaseTime: constDefaultMaxLeaseTime,
+			ReleaseGrace: constDefaultReleaseGrace,
 			DNSPrefix:    t.Name() + "-dns",
 			DNSZone:      "example.test",
 		},
@@ -130,6 +132,49 @@ func (p *PluginState) leasedIPKey(ip string) string {
 func (p *PluginState) leasedNicKey(nic string) string {
 	return p.config.Prefix + p.config.Separator + "nics" + p.config.Separator +
 		"leased" + p.config.Separator + nic
+}
+
+func (p *PluginState) grantedNicKey(nic string) string {
+	return p.config.Prefix + p.config.Separator + "nics" + p.config.Separator +
+		"granted" + p.config.Separator + nic
+}
+
+// readGrant decodes the grant recorded for nic, failing the test if there is
+// none.
+func (p *PluginState) readGrant(t *testing.T, nic string) grant {
+	t.Helper()
+
+	raw, ok := getKey(t, p.grantedNicKey(nic))
+	if !ok {
+		t.Fatalf("no grant recorded for %s", nic)
+	}
+
+	var g grant
+	if err := json.Unmarshal([]byte(raw), &g); err != nil {
+		t.Fatalf("could not decode grant for %s: %v", nic, err)
+	}
+	return g
+}
+
+// backdateGrant moves the grant of nic's binding into the past, on the same
+// etcd lease, so that a release can be made to look as late as a real one would
+// be without the test having to wait it out.
+func (p *PluginState) backdateGrant(t *testing.T, nic string, by time.Duration) {
+	t.Helper()
+
+	g := p.readGrant(t, nic)
+	g.Time = g.Time.Add(-by)
+
+	raw, err := json.Marshal(g)
+	if err != nil {
+		t.Fatalf("could not encode grant: %v", err)
+	}
+
+	key := p.grantedNicKey(nic)
+	if _, err := etcd.NewKV(testClient).Put(context.Background(), key, string(raw),
+		etcd.WithLease(keyLease(t, key))); err != nil {
+		t.Fatalf("could not backdate grant for %s: %v", nic, err)
+	}
 }
 
 // getKey returns the value of a key and whether it exists.

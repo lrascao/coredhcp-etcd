@@ -35,7 +35,7 @@ func TestBootstrapDoesNotDisturbLeasedAddresses(t *testing.T) {
 	p := bootstrapped(t, "10.0.0.1", "10.0.0.4")
 	nic := mustParseMAC(t, "aa:bb:cc:dd:ee:01")
 
-	if _, err := p.leaseIP(ctx, nic, net.ParseIP("10.0.0.1"), time.Minute); err != nil {
+	if _, err := p.leaseIP(ctx, nic, net.ParseIP("10.0.0.1"), time.Minute, testServerIP); err != nil {
 		t.Fatalf("could not lease 10.0.0.1: %v", err)
 	}
 
@@ -59,7 +59,7 @@ func TestLeaseIPTakesAddressOutOfFreePool(t *testing.T) {
 	nic := mustParseMAC(t, "aa:bb:cc:dd:ee:01")
 	ip := net.ParseIP("10.0.0.2")
 
-	leaseID, err := p.leaseIP(ctx, nic, ip, time.Minute)
+	leaseID, err := p.leaseIP(ctx, nic, ip, time.Minute, testServerIP)
 	if err != nil {
 		t.Fatalf("could not lease: %v", err)
 	}
@@ -91,11 +91,11 @@ func TestLeaseIPRefusesAddressHeldByAnotherNic(t *testing.T) {
 	second := mustParseMAC(t, "aa:bb:cc:dd:ee:02")
 	ip := net.ParseIP("10.0.0.2")
 
-	if _, err := p.leaseIP(ctx, first, ip, time.Minute); err != nil {
+	if _, err := p.leaseIP(ctx, first, ip, time.Minute, testServerIP); err != nil {
 		t.Fatalf("could not lease for the first nic: %v", err)
 	}
 
-	_, err := p.leaseIP(ctx, second, ip, time.Minute)
+	_, err := p.leaseIP(ctx, second, ip, time.Minute, testServerIP)
 	if err == nil {
 		t.Fatal("two nics were allowed to hold the same address")
 	}
@@ -114,14 +114,14 @@ func TestLeaseIPRenewsExistingAssociation(t *testing.T) {
 	nic := mustParseMAC(t, "aa:bb:cc:dd:ee:01")
 	ip := net.ParseIP("10.0.0.2")
 
-	first, err := p.leaseIP(ctx, nic, ip, time.Minute)
+	first, err := p.leaseIP(ctx, nic, ip, time.Minute, testServerIP)
 	if err != nil {
 		t.Fatalf("could not lease: %v", err)
 	}
 
 	// renewing goes down the else branch: the address is no longer free, but
 	// the association still matches
-	second, err := p.leaseIP(ctx, nic, ip, 10*time.Minute)
+	second, err := p.leaseIP(ctx, nic, ip, 10*time.Minute, testServerIP)
 	if err != nil {
 		t.Fatalf("could not renew: %v", err)
 	}
@@ -143,7 +143,7 @@ func TestLeaseIPRefusesAddressOutsideThePool(t *testing.T) {
 	nic := mustParseMAC(t, "aa:bb:cc:dd:ee:01")
 
 	// a client is free to ask for anything at all
-	_, err := p.leaseIP(ctx, nic, net.ParseIP("8.8.8.8"), time.Minute)
+	_, err := p.leaseIP(ctx, nic, net.ParseIP("8.8.8.8"), time.Minute, testServerIP)
 	if !errors.Is(err, ErrAlreadyLeased) {
 		t.Errorf("got %v, want ErrAlreadyLeased for an address that was never in the pool", err)
 	}
@@ -163,7 +163,7 @@ func TestLeaseIPDoesNotLeakLeasesOnFailure(t *testing.T) {
 	before := countLeases(t)
 
 	for i := 0; i < 20; i++ {
-		if _, err := p.leaseIP(ctx, nic, net.ParseIP("8.8.8.8"), 24*time.Hour); err == nil {
+		if _, err := p.leaseIP(ctx, nic, net.ParseIP("8.8.8.8"), 24*time.Hour, testServerIP); err == nil {
 			t.Fatal("expected the request to be refused")
 		}
 	}
@@ -182,7 +182,7 @@ func TestFreeIPReportsAnExhaustedPool(t *testing.T) {
 		if err != nil {
 			t.Fatalf("could not get a free ip on iteration %d: %v", i, err)
 		}
-		if _, err := p.leaseIP(ctx, mustParseMAC(t, nic), ip, time.Minute); err != nil {
+		if _, err := p.leaseIP(ctx, mustParseMAC(t, nic), ip, time.Minute, testServerIP); err != nil {
 			t.Fatalf("could not lease %v: %v", ip, err)
 		}
 	}
@@ -198,7 +198,7 @@ func TestRevokeLeaseReturnsAddressToPool(t *testing.T) {
 	nic := mustParseMAC(t, "aa:bb:cc:dd:ee:01")
 	ip := net.ParseIP("10.0.0.2")
 
-	if _, err := p.leaseIP(ctx, nic, ip, time.Minute); err != nil {
+	if _, err := p.leaseIP(ctx, nic, ip, time.Minute, testServerIP); err != nil {
 		t.Fatalf("could not lease: %v", err)
 	}
 
@@ -226,7 +226,7 @@ func TestRevokeLeaseRefusesAnAddressTheNicDoesNotHold(t *testing.T) {
 	nic := mustParseMAC(t, "aa:bb:cc:dd:ee:01")
 	held := net.ParseIP("10.0.0.2")
 
-	if _, err := p.leaseIP(ctx, nic, held, time.Minute); err != nil {
+	if _, err := p.leaseIP(ctx, nic, held, time.Minute, testServerIP); err != nil {
 		t.Fatalf("could not lease: %v", err)
 	}
 
@@ -250,10 +250,10 @@ func TestRevokeLeaseRefusesAnAddressHeldByAnotherNic(t *testing.T) {
 	attacker := mustParseMAC(t, "aa:bb:cc:dd:ee:01")
 	victim := mustParseMAC(t, "aa:bb:cc:dd:ee:02")
 
-	if _, err := p.leaseIP(ctx, attacker, net.ParseIP("10.0.0.2"), time.Minute); err != nil {
+	if _, err := p.leaseIP(ctx, attacker, net.ParseIP("10.0.0.2"), time.Minute, testServerIP); err != nil {
 		t.Fatalf("could not lease for the attacker: %v", err)
 	}
-	if _, err := p.leaseIP(ctx, victim, net.ParseIP("10.0.0.3"), time.Minute); err != nil {
+	if _, err := p.leaseIP(ctx, victim, net.ParseIP("10.0.0.3"), time.Minute, testServerIP); err != nil {
 		t.Fatalf("could not lease for the victim: %v", err)
 	}
 
@@ -301,7 +301,7 @@ func TestRevokeLeaseTearsDownDNSRecords(t *testing.T) {
 	nic := mustParseMAC(t, "aa:bb:cc:dd:ee:01")
 	ip := net.ParseIP("10.0.0.2")
 
-	leaseID, err := p.leaseIP(ctx, nic, ip, time.Minute)
+	leaseID, err := p.leaseIP(ctx, nic, ip, time.Minute, testServerIP)
 	if err != nil {
 		t.Fatalf("could not lease: %v", err)
 	}
@@ -324,6 +324,267 @@ func TestRevokeLeaseTearsDownDNSRecords(t *testing.T) {
 	}
 }
 
+func TestLeaseIPRecordsTheGrant(t *testing.T) {
+	ctx := context.Background()
+	p := bootstrapped(t, "10.0.0.1", "10.0.0.4")
+	nic := mustParseMAC(t, "aa:bb:cc:dd:ee:01")
+
+	before := time.Now()
+	leaseID, err := p.leaseIP(ctx, nic, net.ParseIP("10.0.0.2"), time.Minute, testServerIP)
+	if err != nil {
+		t.Fatalf("could not lease: %v", err)
+	}
+
+	g := p.readGrant(t, nic.String())
+	if g.Server != testServerIP.String() {
+		t.Errorf("grant names server %q, want %q", g.Server, testServerIP)
+	}
+	if g.Time.Before(before.Add(-time.Second)) || g.Time.After(time.Now().Add(time.Second)) {
+		t.Errorf("grant is timestamped %v, not around now", g.Time)
+	}
+
+	// on the binding's own lease, so that it describes this instance of the
+	// binding and goes away with it
+	if got := keyLease(t, p.grantedNicKey(nic.String())); got != leaseID {
+		t.Errorf("grant is on lease %d, want the binding's %d", got, leaseID)
+	}
+}
+
+func TestLeaseIPRenewalRewritesTheGrant(t *testing.T) {
+	ctx := context.Background()
+	p := bootstrapped(t, "10.0.0.1", "10.0.0.4")
+	nic := mustParseMAC(t, "aa:bb:cc:dd:ee:01")
+	ip := net.ParseIP("10.0.0.2")
+	other := net.IP{10, 0, 0, 253}
+
+	if _, err := p.leaseIP(ctx, nic, ip, time.Minute, testServerIP); err != nil {
+		t.Fatalf("could not lease: %v", err)
+	}
+	renewed, err := p.leaseIP(ctx, nic, ip, time.Minute, other)
+	if err != nil {
+		t.Fatalf("could not renew: %v", err)
+	}
+
+	if g := p.readGrant(t, nic.String()); g.Server != other.String() {
+		t.Errorf("grant still names %q after %v renewed the binding", g.Server, other)
+	}
+	if got := keyLease(t, p.grantedNicKey(nic.String())); got != renewed {
+		t.Errorf("grant is on lease %d, want the renewed %d", got, renewed)
+	}
+}
+
+func TestReleaseLeaseReturnsAddressToPool(t *testing.T) {
+	ctx := context.Background()
+	p := bootstrapped(t, "10.0.0.1", "10.0.0.4")
+	nic := mustParseMAC(t, "aa:bb:cc:dd:ee:01")
+	ip := net.ParseIP("10.0.0.2")
+
+	if _, err := p.leaseIP(ctx, nic, ip, time.Minute, testServerIP); err != nil {
+		t.Fatalf("could not lease: %v", err)
+	}
+	p.backdateGrant(t, nic.String(), time.Hour)
+
+	if err := p.releaseLease(ctx, nic, ip, testServerIP); err != nil {
+		t.Fatalf("could not release: %v", err)
+	}
+
+	if got, ok := getKey(t, p.freeKey("10.0.0.2")); !ok || got != "10.0.0.2" {
+		t.Error("the address did not go back into the free pool")
+	}
+	if _, ok := getKey(t, p.leasedNicKey(nic.String())); ok {
+		t.Error("the nic->ip mapping survived the release")
+	}
+	if _, ok := getKey(t, p.grantedNicKey(nic.String())); ok {
+		t.Error("the grant survived the binding it describes")
+	}
+}
+
+// The incident this exists for, 2026-10-13: node3 granted a Shelly .106 at
+// 06:01:44, the Shelly reconnected and node2 granted it .106 again at
+// 06:33:17.228, and 49ms later the old session's RELEASE of .106 reached node3.
+// node3 put .106 back into the free pool and a phone was handed it at 07:26:57
+// while the Shelly was still using it.
+func TestReleaseLeaseRefusesAReleaseAddressedToAnotherServer(t *testing.T) {
+	ctx := context.Background()
+	p := bootstrapped(t, "10.0.0.1", "10.0.0.4")
+	shelly := mustParseMAC(t, "dc:b4:d9:c8:90:dc")
+	ip := net.ParseIP("10.0.0.2")
+	node2, node3 := net.IP{10, 0, 0, 252}, net.IP{10, 0, 0, 253}
+
+	if _, err := p.leaseIP(ctx, shelly, ip, time.Minute, node3); err != nil {
+		t.Fatalf("could not lease: %v", err)
+	}
+	leaseID, err := p.leaseIP(ctx, shelly, ip, time.Minute, node2)
+	if err != nil {
+		t.Fatalf("could not renew: %v", err)
+	}
+	if err := p.dns.Register(ctx, testClient, "shelly", ip, shelly, leaseID); err != nil {
+		t.Fatalf("could not register dns: %v", err)
+	}
+	// the server is enough on its own, however late the release turns up
+	p.backdateGrant(t, shelly.String(), time.Hour)
+
+	err = p.releaseLease(ctx, shelly, ip, node3)
+	if !errors.Is(err, ErrStaleRelease) {
+		t.Fatalf("got %v, want ErrStaleRelease", err)
+	}
+
+	if got, _ := getKey(t, p.leasedNicKey(shelly.String())); got != "10.0.0.2" {
+		t.Errorf("the binding node2 granted was destroyed: nic maps to %q", got)
+	}
+	if _, ok := getKey(t, p.freeKey("10.0.0.2")); ok {
+		t.Error("an address still in use went back into the free pool")
+	}
+	nameKey := p.config.DNSPrefix + constDefaultSeparator + "example.test" +
+		constDefaultSeparator + "shelly" + constDefaultSeparator + "A"
+	if _, ok := getKey(t, nameKey); !ok {
+		t.Error("the refused release still tore down the dns record")
+	}
+}
+
+// The same thing when both sessions happened to go to the same server, as at
+// 2026-10-13 05:18:21: node4 acked .126 and the RELEASE of the previous lease,
+// also node4's, followed 364ms later. Only the timing tells them apart.
+func TestReleaseLeaseRefusesAReleaseRightAfterTheGrant(t *testing.T) {
+	ctx := context.Background()
+	p := bootstrapped(t, "10.0.0.1", "10.0.0.4")
+	shelly := mustParseMAC(t, "dc:b4:d9:c8:90:dc")
+	ip := net.ParseIP("10.0.0.2")
+
+	if _, err := p.leaseIP(ctx, shelly, ip, time.Minute, testServerIP); err != nil {
+		t.Fatalf("could not lease: %v", err)
+	}
+
+	err := p.releaseLease(ctx, shelly, ip, testServerIP)
+	if !errors.Is(err, ErrStaleRelease) {
+		t.Fatalf("got %v, want ErrStaleRelease", err)
+	}
+
+	if got, _ := getKey(t, p.leasedNicKey(shelly.String())); got != "10.0.0.2" {
+		t.Errorf("the binding was destroyed: nic maps to %q", got)
+	}
+	if _, ok := getKey(t, p.freeKey("10.0.0.2")); ok {
+		t.Error("an address still in use went back into the free pool")
+	}
+}
+
+// Bindings granted before grants existed, or renewed by a node still running a
+// version that does not write them, have nothing to check against. Those are
+// released exactly as they were before, rather than held on a guess.
+func TestReleaseLeaseWithoutAGrantIsReleasedAsBefore(t *testing.T) {
+	ctx := context.Background()
+	p := bootstrapped(t, "10.0.0.1", "10.0.0.4")
+	nic := mustParseMAC(t, "aa:bb:cc:dd:ee:01")
+	ip := net.ParseIP("10.0.0.2")
+
+	if _, err := p.leaseIP(ctx, nic, ip, time.Minute, testServerIP); err != nil {
+		t.Fatalf("could not lease: %v", err)
+	}
+	if _, err := etcd.NewKV(testClient).Delete(ctx, p.grantedNicKey(nic.String())); err != nil {
+		t.Fatalf("could not drop the grant: %v", err)
+	}
+
+	if err := p.releaseLease(ctx, nic, ip, net.IP{10, 0, 0, 253}); err != nil {
+		t.Fatalf("a binding with no grant was not released: %v", err)
+	}
+	if _, ok := getKey(t, p.freeKey("10.0.0.2")); !ok {
+		t.Error("the address did not go back into the free pool")
+	}
+}
+
+// What a renewal by an older version leaves behind: the binding moved onto a
+// fresh lease, and the grant still sitting on the lease it came from. That
+// grant is about a previous instance of the binding and must not be taken as
+// evidence about the current one.
+func TestReleaseLeaseIgnoresAGrantFromAnEarlierLease(t *testing.T) {
+	ctx := context.Background()
+	p := bootstrapped(t, "10.0.0.1", "10.0.0.4")
+	nic := mustParseMAC(t, "aa:bb:cc:dd:ee:01")
+	ip := net.ParseIP("10.0.0.2")
+
+	if _, err := p.leaseIP(ctx, nic, ip, time.Minute, testServerIP); err != nil {
+		t.Fatalf("could not lease: %v", err)
+	}
+
+	lease, err := etcd.NewLease(testClient).Grant(ctx, 60)
+	if err != nil {
+		t.Fatalf("could not grant: %v", err)
+	}
+	kvc := etcd.NewKV(testClient)
+	for key, value := range map[string]string{
+		p.leasedNicKey(nic.String()): "10.0.0.2",
+		p.leasedIPKey("10.0.0.2"):    nic.String(),
+	} {
+		if _, err := kvc.Put(ctx, key, value, etcd.WithLease(lease.ID)); err != nil {
+			t.Fatalf("could not renew the old way: %v", err)
+		}
+	}
+
+	if err := p.releaseLease(ctx, nic, ip, net.IP{10, 0, 0, 253}); err != nil {
+		t.Fatalf("a grant from an earlier lease blocked the release: %v", err)
+	}
+	if _, ok := getKey(t, p.freeKey("10.0.0.2")); !ok {
+		t.Error("the address did not go back into the free pool")
+	}
+}
+
+// A DECLINE is the client's verdict on the lease it has just been granted, so
+// it is expected right after the grant and must not be held to the release
+// rules.
+func TestRevokeLeaseIgnoresTheGrant(t *testing.T) {
+	ctx := context.Background()
+	p := bootstrapped(t, "10.0.0.1", "10.0.0.4")
+	nic := mustParseMAC(t, "aa:bb:cc:dd:ee:01")
+	ip := net.ParseIP("10.0.0.2")
+
+	if _, err := p.leaseIP(ctx, nic, ip, time.Minute, testServerIP); err != nil {
+		t.Fatalf("could not lease: %v", err)
+	}
+
+	if err := p.revokeLease(ctx, nic, ip); err != nil {
+		t.Fatalf("could not revoke straight after the grant: %v", err)
+	}
+	if _, ok := getKey(t, p.leasedNicKey(nic.String())); ok {
+		t.Error("the binding survived the revoke")
+	}
+	if _, ok := getKey(t, p.grantedNicKey(nic.String())); ok {
+		t.Error("the grant survived the binding it describes")
+	}
+}
+
+// The check and the teardown are separate round trips. A renewal that lands
+// between them has produced a binding the check never saw, and the teardown
+// must leave it alone.
+func TestUnbindDoesNotUndoARenewalInBetween(t *testing.T) {
+	ctx := context.Background()
+	p := bootstrapped(t, "10.0.0.1", "10.0.0.4")
+	nic := mustParseMAC(t, "aa:bb:cc:dd:ee:01")
+	ip := net.ParseIP("10.0.0.2")
+
+	if _, err := p.leaseIP(ctx, nic, ip, time.Minute, testServerIP); err != nil {
+		t.Fatalf("could not lease: %v", err)
+	}
+	b, err := p.readBinding(ctx, nic, ip)
+	if err != nil {
+		t.Fatalf("could not read the binding: %v", err)
+	}
+
+	renewed, err := p.leaseIP(ctx, nic, ip, time.Minute, testServerIP)
+	if err != nil {
+		t.Fatalf("could not renew: %v", err)
+	}
+
+	if err := p.unbind(ctx, b); !errors.Is(err, ErrNotLeased) {
+		t.Errorf("got %v, want ErrNotLeased", err)
+	}
+	if got := keyLease(t, p.leasedNicKey(nic.String())); got != renewed {
+		t.Errorf("the renewed binding was disturbed: nic key is on lease %d, want %d", got, renewed)
+	}
+	if _, ok := getKey(t, p.freeKey("10.0.0.2")); ok {
+		t.Error("the renewed address went back into the free pool")
+	}
+}
+
 // An expired lease leaves the address in neither the free nor the leased set.
 // Revoking the etcd lease deletes exactly the keys expiry would have deleted,
 // which is what lets this run without waiting out a real TTL.
@@ -333,7 +594,7 @@ func TestResurrectLeasesReclaimsExpiredAddresses(t *testing.T) {
 	nic := mustParseMAC(t, "aa:bb:cc:dd:ee:01")
 	ip := net.ParseIP("10.0.0.2")
 
-	leaseID, err := p.leaseIP(ctx, nic, ip, time.Minute)
+	leaseID, err := p.leaseIP(ctx, nic, ip, time.Minute, testServerIP)
 	if err != nil {
 		t.Fatalf("could not lease: %v", err)
 	}
@@ -360,7 +621,7 @@ func TestResurrectLeasesLeavesLiveLeasesAlone(t *testing.T) {
 	nic := mustParseMAC(t, "aa:bb:cc:dd:ee:01")
 	ip := net.ParseIP("10.0.0.2")
 
-	if _, err := p.leaseIP(ctx, nic, ip, time.Minute); err != nil {
+	if _, err := p.leaseIP(ctx, nic, ip, time.Minute, testServerIP); err != nil {
 		t.Fatalf("could not lease: %v", err)
 	}
 
@@ -388,7 +649,7 @@ func TestLeaseExpiryRemovesBothHalvesTogether(t *testing.T) {
 	nic := mustParseMAC(t, "aa:bb:cc:dd:ee:01")
 	ip := net.ParseIP("10.0.0.2")
 
-	if _, err := p.leaseIP(ctx, nic, ip, time.Second); err != nil {
+	if _, err := p.leaseIP(ctx, nic, ip, time.Second, testServerIP); err != nil {
 		t.Fatalf("could not lease: %v", err)
 	}
 
