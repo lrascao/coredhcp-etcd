@@ -359,6 +359,98 @@ func TestHandlerReleaseNamingTheWrongAddressIsRefused(t *testing.T) {
 	}
 }
 
+// declineTo is a DECLINE of ip, addressed to server. RFC 2131 has the declined
+// address in the requested IP option, ciaddr is zero.
+func declineTo(t *testing.T, mac net.HardwareAddr, server, ip net.IP) *dhcpv4.DHCPv4 {
+	t.Helper()
+
+	req, err := dhcpv4.New(
+		dhcpv4.WithMessageType(dhcpv4.MessageTypeDecline),
+		dhcpv4.WithHwAddr(mac),
+		dhcpv4.WithOption(dhcpv4.OptServerIdentifier(server)),
+		dhcpv4.WithOption(dhcpv4.OptRequestedIPAddress(ip)),
+	)
+	if err != nil {
+		t.Fatalf("could not build decline: %v", err)
+	}
+	return req
+}
+
+// The 2026-10-10 loop through the handler: 5c:9b:a6:65:15:26 was granted
+// 192.168.3.106, found a Shelly still answering ARP for it and declined it, and
+// its next DISCOVER was offered .106 again, 47 times in two hours. However many
+// addresses a client turns down, it must never be offered one of them back.
+func TestHandlerDeclinedAddressIsNotOfferedAgain(t *testing.T) {
+	p := bootstrapped(t, "10.0.0.1", "10.0.0.4")
+	client := mustParseMAC(t, "5c:9b:a6:65:15:26")
+
+	declined := map[string]bool{}
+	for i := 0; i < 3; i++ {
+		d := discover(t, client)
+		offer, _ := p.Handler4(d, reply(t, d, dhcpv4.MessageTypeOffer))
+		if offer == nil {
+			t.Fatalf("discover %d was dropped", i)
+		}
+		ip := offer.YourIPAddr
+		if declined[ip.String()] {
+			t.Fatalf("discover %d was offered %v, which the client has already declined", i, ip)
+		}
+
+		req := requestTo(t, client, testServerIP, ip)
+		if resp, _ := p.Handler4(req, reply(t, req, dhcpv4.MessageTypeAck)); resp == nil ||
+			resp.MessageType() != dhcpv4.MessageTypeAck {
+			t.Fatalf("request %d for %v was not acked", i, ip)
+		}
+
+		req = declineTo(t, client, testServerIP, ip)
+		p.Handler4(req, reply(t, req, dhcpv4.MessageTypeNone))
+		declined[ip.String()] = true
+
+		if got, ok := getKey(t, p.declinedKey(ip.String())); !ok || got != client.String() {
+			t.Errorf("%v was not quarantined by the decline: got %q, %v", ip, got, ok)
+		}
+		if _, ok := getKey(t, p.leasedNicKey(client.String())); ok {
+			t.Errorf("the binding on %v survived the decline", ip)
+		}
+	}
+
+	// nor is anybody else
+	d := discover(t, mustParseMAC(t, "aa:bb:cc:dd:ee:02"))
+	resp, _ := p.Handler4(d, reply(t, d, dhcpv4.MessageTypeOffer))
+	if resp == nil || declined[resp.YourIPAddr.String()] {
+		t.Errorf("another client was offered %v, want the one address nobody declined", resp.YourIPAddr)
+	}
+}
+
+// Asking for a quarantined address outright, as the declining client might in
+// INIT-REBOOT or the host squatting on it might when it renews, does not get
+// around the quarantine.
+func TestHandlerRequestForAQuarantinedAddressIsNaked(t *testing.T) {
+	p := bootstrapped(t, "10.0.0.1", "10.0.0.4")
+	client := mustParseMAC(t, "5c:9b:a6:65:15:26")
+	squatter := mustParseMAC(t, "dc:b4:d9:c8:90:dc")
+	ip := net.ParseIP("10.0.0.1")
+
+	req := requestTo(t, client, testServerIP, ip)
+	if resp, _ := p.Handler4(req, reply(t, req, dhcpv4.MessageTypeAck)); resp == nil ||
+		resp.MessageType() != dhcpv4.MessageTypeAck {
+		t.Fatal("the request was not acked")
+	}
+	req = declineTo(t, client, testServerIP, ip)
+	p.Handler4(req, reply(t, req, dhcpv4.MessageTypeNone))
+
+	for _, mac := range []net.HardwareAddr{client, squatter} {
+		req := requestTo(t, mac, testServerIP, ip)
+		resp, _ := p.Handler4(req, reply(t, req, dhcpv4.MessageTypeAck))
+		if resp == nil || resp.MessageType() != dhcpv4.MessageTypeNak {
+			t.Errorf("%v asking for the quarantined %v got %v, want a NAK", mac, ip, resp.MessageType())
+		}
+		if _, ok := getKey(t, p.leasedNicKey(mac.String())); ok {
+			t.Errorf("%v was bound to the quarantined %v", mac, ip)
+		}
+	}
+}
+
 // The whole 2026-10-13 sequence through the handler, with two servers sharing
 // one set of bindings: node3 grants the Shelly an address, the Shelly
 // reconnects and node2 grants it the same address, and the old session's

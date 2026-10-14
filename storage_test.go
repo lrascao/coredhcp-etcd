@@ -53,6 +53,34 @@ func TestBootstrapDoesNotDisturbLeasedAddresses(t *testing.T) {
 	}
 }
 
+// A declined address is in neither the free nor the leased set, which is
+// exactly what bootstrap is looking for. A restart in the middle of a
+// probation must not cut it short.
+func TestBootstrapLeavesQuarantinedAddressesAlone(t *testing.T) {
+	ctx := context.Background()
+	p := bootstrapped(t, "10.0.0.1", "10.0.0.4")
+	nic := mustParseMAC(t, "aa:bb:cc:dd:ee:01")
+	ip := net.ParseIP("10.0.0.1")
+
+	if _, err := p.leaseIP(ctx, nic, ip, time.Minute, testServerIP); err != nil {
+		t.Fatalf("could not lease: %v", err)
+	}
+	if err := p.revokeLease(ctx, nic, ip); err != nil {
+		t.Fatalf("could not decline: %v", err)
+	}
+
+	if err := p.bootstrapLeasableRange(ctx); err != nil {
+		t.Fatalf("second bootstrap failed: %v", err)
+	}
+
+	if _, ok := getKey(t, p.freeKey("10.0.0.1")); ok {
+		t.Error("bootstrap returned a quarantined address to the free pool")
+	}
+	if _, ok := getKey(t, p.declinedKey("10.0.0.1")); !ok {
+		t.Error("bootstrap disturbed the quarantine")
+	}
+}
+
 func TestLeaseIPTakesAddressOutOfFreePool(t *testing.T) {
 	ctx := context.Background()
 	p := bootstrapped(t, "10.0.0.1", "10.0.0.4")
@@ -192,13 +220,17 @@ func TestFreeIPReportsAnExhaustedPool(t *testing.T) {
 	}
 }
 
-func TestRevokeLeaseReturnsAddressToPool(t *testing.T) {
+// RFC 2131 4.3.3: on a DECLINE the server must mark the address as not
+// available. It goes into quarantine, on an etcd lease of its own that runs
+// for the probation period, rather than back into the free pool.
+func TestRevokeLeaseQuarantinesTheAddress(t *testing.T) {
 	ctx := context.Background()
 	p := bootstrapped(t, "10.0.0.1", "10.0.0.4")
 	nic := mustParseMAC(t, "aa:bb:cc:dd:ee:01")
 	ip := net.ParseIP("10.0.0.2")
 
-	if _, err := p.leaseIP(ctx, nic, ip, time.Minute, testServerIP); err != nil {
+	bindingLease, err := p.leaseIP(ctx, nic, ip, time.Minute, testServerIP)
+	if err != nil {
 		t.Fatalf("could not lease: %v", err)
 	}
 
@@ -206,9 +238,25 @@ func TestRevokeLeaseReturnsAddressToPool(t *testing.T) {
 		t.Fatalf("could not revoke: %v", err)
 	}
 
-	if got, ok := getKey(t, p.freeKey("10.0.0.2")); !ok || got != "10.0.0.2" {
-		t.Error("the address did not go back into the free pool")
+	if _, ok := getKey(t, p.freeKey("10.0.0.2")); ok {
+		t.Error("the declined address went back into the free pool")
 	}
+	if got, ok := getKey(t, p.declinedKey("10.0.0.2")); !ok || got != nic.String() {
+		t.Errorf("the declined address was not quarantined by %v: got %q, %v", nic, got, ok)
+	}
+
+	probation := keyLease(t, p.declinedKey("10.0.0.2"))
+	if probation == 0 || probation == bindingLease {
+		t.Fatalf("the quarantine is on lease %d, want one of its own", probation)
+	}
+	ttl, err := etcd.NewLease(testClient).TimeToLive(ctx, probation)
+	if err != nil {
+		t.Fatalf("could not read the probation ttl: %v", err)
+	}
+	if want := int64(p.config.DeclineProbation.Seconds()); ttl.GrantedTTL != want {
+		t.Errorf("the quarantine lasts %ds, want %ds", ttl.GrantedTTL, want)
+	}
+
 	if _, ok := getKey(t, p.leasedIPKey("10.0.0.2")); ok {
 		t.Error("the ip->nic mapping survived the revoke")
 	}
@@ -271,8 +319,36 @@ func TestRevokeLeaseRefusesAnAddressHeldByAnotherNic(t *testing.T) {
 	if _, ok := getKey(t, p.freeKey("10.0.0.3")); ok {
 		t.Error("the victim's address was put back into the free pool")
 	}
+	if _, ok := getKey(t, p.declinedKey("10.0.0.3")); ok {
+		t.Error("the victim's address was quarantined")
+	}
 	if got, _ := getKey(t, p.leasedNicKey(attacker.String())); got != "10.0.0.2" {
 		t.Errorf("the caller's own association was corrupted: %q", got)
+	}
+}
+
+// freeIP hands out the lowest free address, so a declined address that went
+// straight back into the pool was the very next one offered: the 47 DECLINEs
+// of 192.168.3.106 on 2026-10-10.
+func TestFreeIPSkipsAQuarantinedAddress(t *testing.T) {
+	ctx := context.Background()
+	p := bootstrapped(t, "10.0.0.1", "10.0.0.4")
+	nic := mustParseMAC(t, "5c:9b:a6:65:15:26")
+	ip := net.ParseIP("10.0.0.1")
+
+	if _, err := p.leaseIP(ctx, nic, ip, time.Minute, testServerIP); err != nil {
+		t.Fatalf("could not lease: %v", err)
+	}
+	if err := p.revokeLease(ctx, nic, ip); err != nil {
+		t.Fatalf("could not decline: %v", err)
+	}
+
+	got, err := p.freeIP(ctx)
+	if err != nil {
+		t.Fatalf("could not get a free ip: %v", err)
+	}
+	if got.Equal(ip) {
+		t.Errorf("freeIP offered %v again straight after it was declined", ip)
 	}
 }
 
@@ -290,6 +366,9 @@ func TestRevokeLeaseRefusesANicWithNoLease(t *testing.T) {
 	// must not have been put into the pool a second time
 	if n := countKeys(t, p.freeKey("10.0.0.2")); n != 1 {
 		t.Errorf("free pool holds %d copies of 10.0.0.2, want 1", n)
+	}
+	if _, ok := getKey(t, p.declinedKey("10.0.0.2")); ok {
+		t.Error("a DECLINE from a nic holding nothing quarantined a free address")
 	}
 }
 
@@ -321,6 +400,11 @@ func TestRevokeLeaseTearsDownDNSRecords(t *testing.T) {
 
 	if got, ok := getKey(t, nameKey); ok {
 		t.Errorf("dns record survived the release and still resolves to %q", got)
+	}
+	// revoking the binding's etcd lease is what takes the records down, and
+	// it must not take the quarantine with it
+	if _, ok := getKey(t, p.declinedKey("10.0.0.2")); !ok {
+		t.Error("tearing down the dns records ended the quarantine")
 	}
 }
 
@@ -390,6 +474,9 @@ func TestReleaseLeaseReturnsAddressToPool(t *testing.T) {
 
 	if got, ok := getKey(t, p.freeKey("10.0.0.2")); !ok || got != "10.0.0.2" {
 		t.Error("the address did not go back into the free pool")
+	}
+	if _, ok := getKey(t, p.declinedKey("10.0.0.2")); ok {
+		t.Error("a released address was quarantined")
 	}
 	if _, ok := getKey(t, p.leasedNicKey(nic.String())); ok {
 		t.Error("the nic->ip mapping survived the release")
@@ -574,7 +661,7 @@ func TestUnbindDoesNotUndoARenewalInBetween(t *testing.T) {
 		t.Fatalf("could not renew: %v", err)
 	}
 
-	if err := p.unbind(ctx, b); !errors.Is(err, ErrNotLeased) {
+	if err := p.unbind(ctx, b, etcd.OpPut(b.freeIPKey, b.ip.String())); !errors.Is(err, ErrNotLeased) {
 		t.Errorf("got %v, want ErrNotLeased", err)
 	}
 	if got := keyLease(t, p.leasedNicKey(nic.String())); got != renewed {
@@ -582,6 +669,43 @@ func TestUnbindDoesNotUndoARenewalInBetween(t *testing.T) {
 	}
 	if _, ok := getKey(t, p.freeKey("10.0.0.2")); ok {
 		t.Error("the renewed address went back into the free pool")
+	}
+}
+
+// The same race for a DECLINE, which on top of leaving the renewal alone must
+// hand back the probation lease it granted and then had no use for.
+func TestQuarantineDoesNotUndoARenewalInBetween(t *testing.T) {
+	ctx := context.Background()
+	p := bootstrapped(t, "10.0.0.1", "10.0.0.4")
+	nic := mustParseMAC(t, "aa:bb:cc:dd:ee:01")
+	ip := net.ParseIP("10.0.0.2")
+
+	if _, err := p.leaseIP(ctx, nic, ip, time.Minute, testServerIP); err != nil {
+		t.Fatalf("could not lease: %v", err)
+	}
+	b, err := p.readBinding(ctx, nic, ip)
+	if err != nil {
+		t.Fatalf("could not read the binding: %v", err)
+	}
+
+	renewed, err := p.leaseIP(ctx, nic, ip, time.Minute, testServerIP)
+	if err != nil {
+		t.Fatalf("could not renew: %v", err)
+	}
+
+	before := countLeases(t)
+
+	if err := p.quarantine(ctx, b); !errors.Is(err, ErrNotLeased) {
+		t.Errorf("got %v, want ErrNotLeased", err)
+	}
+	if got := keyLease(t, p.leasedNicKey(nic.String())); got != renewed {
+		t.Errorf("the renewed binding was disturbed: nic key is on lease %d, want %d", got, renewed)
+	}
+	if _, ok := getKey(t, p.declinedKey("10.0.0.2")); ok {
+		t.Error("the renewed address was quarantined")
+	}
+	if after := countLeases(t); after != before {
+		t.Errorf("a quarantine that did not happen leaked %d etcd leases", after-before)
 	}
 }
 
@@ -634,6 +758,61 @@ func TestResurrectLeasesLeavesLiveLeasesAlone(t *testing.T) {
 	}
 	if got, _ := getKey(t, p.leasedIPKey("10.0.0.2")); got != nic.String() {
 		t.Error("a live lease was disturbed")
+	}
+}
+
+// resurrectLeases runs every 10s on every node and frees anything in neither
+// the free nor the leased set, which a declined address is on purpose.
+func TestResurrectLeasesLeavesQuarantinedAddressesAlone(t *testing.T) {
+	ctx := context.Background()
+	p := bootstrapped(t, "10.0.0.1", "10.0.0.4")
+	nic := mustParseMAC(t, "aa:bb:cc:dd:ee:01")
+	ip := net.ParseIP("10.0.0.2")
+
+	if _, err := p.leaseIP(ctx, nic, ip, time.Minute, testServerIP); err != nil {
+		t.Fatalf("could not lease: %v", err)
+	}
+	if err := p.revokeLease(ctx, nic, ip); err != nil {
+		t.Fatalf("could not decline: %v", err)
+	}
+
+	if err := p.resurrectLeases(ctx); err != nil {
+		t.Fatalf("could not resurrect: %v", err)
+	}
+
+	if _, ok := getKey(t, p.freeKey("10.0.0.2")); ok {
+		t.Error("resurrect returned a quarantined address to the free pool")
+	}
+	if _, ok := getKey(t, p.declinedKey("10.0.0.2")); !ok {
+		t.Error("resurrect disturbed the quarantine")
+	}
+}
+
+// Once the probation lease expires the address is just another expired one,
+// and the next resurrect returns it to the pool. As above, revoking the lease
+// stands in for waiting it out.
+func TestResurrectLeasesReclaimsAddressesOnceTheProbationEnds(t *testing.T) {
+	ctx := context.Background()
+	p := bootstrapped(t, "10.0.0.1", "10.0.0.4")
+	nic := mustParseMAC(t, "aa:bb:cc:dd:ee:01")
+	ip := net.ParseIP("10.0.0.2")
+
+	if _, err := p.leaseIP(ctx, nic, ip, time.Minute, testServerIP); err != nil {
+		t.Fatalf("could not lease: %v", err)
+	}
+	if err := p.revokeLease(ctx, nic, ip); err != nil {
+		t.Fatalf("could not decline: %v", err)
+	}
+	if _, err := etcd.NewLease(testClient).Revoke(ctx, keyLease(t, p.declinedKey("10.0.0.2"))); err != nil {
+		t.Fatalf("could not end the probation: %v", err)
+	}
+
+	if err := p.resurrectLeases(ctx); err != nil {
+		t.Fatalf("could not resurrect: %v", err)
+	}
+
+	if got, ok := getKey(t, p.freeKey("10.0.0.2")); !ok || got != "10.0.0.2" {
+		t.Error("the address did not go back into the free pool after its probation")
 	}
 }
 

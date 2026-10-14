@@ -25,6 +25,23 @@ const (
 	constDefaultLeaseTime    = 10 * time.Minute
 	constDefaultMinLeaseTime = 1 * time.Minute
 	constDefaultMaxLeaseTime = 24 * time.Hour
+
+	// Kea's default probation for a declined address is 24h. The pool here is
+	// 100 addresses (192.168.3.100-199), and declining clients have been seen
+	// at about four a minute. A client that declines whatever it is offered --
+	// broken ARP probing, or something on the segment answering ARP for every
+	// address -- takes one more address out with every DECLINE, so it keeps
+	// four per minute of probation out at once: 24h would drain the free pool
+	// in well under an hour and keep it drained for a day, ten minutes caps it
+	// at about 40 and leaves the rest of the pool serving.
+	//
+	// What a short probation costs is that a conflict which outlasts it is
+	// found again: once it expires the address is offered, probed and declined
+	// once more. That is one retry for one client every ten minutes, where
+	// before this the declining client was offered the same address on every
+	// DISCOVER.
+	constDefaultDeclineProbation = 10 * time.Minute
+
 	// Every leftover RELEASE seen in production (18 of them from one Shelly
 	// over 4.5 days) arrived within a second of the grant it destroyed. A
 	// genuine release this soon after a grant costs nothing to ignore -- the
@@ -215,7 +232,8 @@ func (p *PluginState) Handler4(req, resp *dhcpv4.DHCPv4) (*dhcpv4.DHCPv4, bool) 
 			return nil, true
 		}
 
-		log.Infof("%s declined %s, returned it to the free pool", req.ClientHWAddr, ip)
+		log.Infof("%s declined %s as already in use, quarantined it for %v",
+			req.ClientHWAddr, ip, p.config.DeclineProbation)
 
 	default:
 		log.Errorf("unhandled DHCPv4 packet %v (%s): ", req.MessageType(), req.Summary())

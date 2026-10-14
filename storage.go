@@ -27,10 +27,16 @@ func (p *PluginState) bootstrapLeasableRange(ctx context.Context) error {
 			"ips" + p.config.Separator +
 			"leased" + p.config.Separator +
 			ipnet.IP.String()
+		declinedIPKey := p.config.Prefix + p.config.Separator +
+			"ips" + p.config.Separator +
+			"declined" + p.config.Separator +
+			ipnet.IP.String()
 
 		res, err := kvc.Txn(ctx).If(
 			etcdutil.KeyMissing(freeIPKey),
 			etcdutil.KeyMissing(leasedIPKey),
+			// a restart must not cut a quarantine short
+			etcdutil.KeyMissing(declinedIPKey),
 		).Then(
 			etcd.OpPut(freeIPKey, ipnet.IP.String()),
 		).Commit()
@@ -101,6 +107,26 @@ func (p *PluginState) resurrectLeases(ctx context.Context) error {
 		free[ip] = struct{}{}
 	}
 
+	// A declined address is out of both sets on purpose, and only comes back
+	// once its probation lease has expired and taken the key with it. See
+	// revokeLease.
+	declinedIPPrefix := p.config.Prefix + p.config.Separator +
+		"ips" + p.config.Separator +
+		"declined" + p.config.Separator
+
+	resp, err = kvc.Get(ctx, declinedIPPrefix, etcd.WithPrefix())
+	if err != nil {
+		return errors.Wrap(err, "could not list declined ips")
+	}
+
+	declined := make(map[string]struct{})
+	for _, kv := range resp.Kvs {
+		parts := strings.Split(string(kv.Key), p.config.Separator)
+		ip := parts[len(parts)-1]
+
+		declined[ip] = struct{}{}
+	}
+
 	for _, ipnet := range p.allocator.Range() {
 		ip := ipnet.IP
 
@@ -108,6 +134,9 @@ func (p *PluginState) resurrectLeases(ctx context.Context) error {
 			continue
 		}
 		if _, ok := leased[ip.String()]; ok {
+			continue
+		}
+		if _, ok := declined[ip.String()]; ok {
 			continue
 		}
 
@@ -120,10 +149,16 @@ func (p *PluginState) resurrectLeases(ctx context.Context) error {
 			"ips" + p.config.Separator +
 			"leased" + p.config.Separator +
 			ip.String()
+		declinedIPKey := p.config.Prefix + p.config.Separator +
+			"ips" + p.config.Separator +
+			"declined" + p.config.Separator +
+			ip.String()
 
 		res, err := kvc.Txn(ctx).If(
 			etcdutil.KeyMissing(freeIPKey),
 			etcdutil.KeyMissing(leasedIPKey),
+			// declined since the listing above
+			etcdutil.KeyMissing(declinedIPKey),
 		).Then(
 			etcd.OpPut(freeIPKey, ip.String()),
 		).Commit()
@@ -301,8 +336,8 @@ type binding struct {
 	nic net.HardwareAddr
 	ip  net.IP
 
-	leasedNicKey, leasedIPKey, grantedNicKey, freeIPKey string
-	leasedNic, leasedIP, grantedNic                     *mvccpb.KeyValue
+	leasedNicKey, leasedIPKey, grantedNicKey, freeIPKey, declinedIPKey string
+	leasedNic, leasedIP, grantedNic                                    *mvccpb.KeyValue
 }
 
 func (p *PluginState) readBinding(ctx context.Context, nic net.HardwareAddr, ip net.IP) (binding, error) {
@@ -326,6 +361,10 @@ func (p *PluginState) readBinding(ctx context.Context, nic net.HardwareAddr, ip 
 		freeIPKey: p.config.Prefix + p.config.Separator +
 			"ips" + p.config.Separator +
 			"free" + p.config.Separator +
+			ip.String(),
+		declinedIPKey: p.config.Prefix + p.config.Separator +
+			"ips" + p.config.Separator +
+			"declined" + p.config.Separator +
 			ip.String(),
 	}
 
@@ -379,10 +418,12 @@ func (b binding) granted() (grant, bool) {
 	return g, true
 }
 
-// unbind tears a binding down and returns its address to the free pool. It only
-// goes ahead if neither half has changed since the binding was read and
-// checked, so that a renewal landing in between is never undone by it.
-func (p *PluginState) unbind(ctx context.Context, b binding) error {
+// unbind tears a binding down and, in the same transaction, puts its address
+// wherever next says: back into the free pool for a release, into quarantine
+// for a decline. It only goes ahead if neither half has changed since the
+// binding was read and checked, so that a renewal landing in between is never
+// undone by it.
+func (p *PluginState) unbind(ctx context.Context, b binding, next etcd.Op) error {
 	kvc := etcd.NewKV(p.client)
 
 	txres, err := kvc.Txn(ctx).If(
@@ -392,7 +433,7 @@ func (p *PluginState) unbind(ctx context.Context, b binding) error {
 		etcd.OpDelete(b.leasedIPKey),
 		etcd.OpDelete(b.leasedNicKey),
 		etcd.OpDelete(b.grantedNicKey),
-		etcd.OpPut(b.freeIPKey, b.ip.String()),
+		next,
 	).Commit()
 	if err != nil {
 		return errors.Wrap(err, "could not delete lease")
@@ -404,29 +445,53 @@ func (p *PluginState) unbind(ctx context.Context, b binding) error {
 	}
 
 	// Whatever else was hanging off the same etcd lease (the DNS records) has to
-	// go with it, the address is in the free pool now and the next client to get
-	// it would otherwise inherit the previous tenant's name.
+	// go with it, the address no longer belongs to this client and the next one
+	// to get it would otherwise inherit the previous tenant's name.
 	if b.leasedNic.Lease == 0 {
 		return nil
 	}
 
 	if _, err := etcd.NewLease(p.client).Revoke(ctx, etcd.LeaseID(b.leasedNic.Lease)); err != nil {
-		// the address is already back in the pool, and the records still go away
-		// on their own once the etcd lease times out
-		log.Errorf("could not revoke etcd lease %d of released ip %v, records linger until it expires: %v",
+		// the binding is already gone, and the records still go away on their
+		// own once the etcd lease times out
+		log.Errorf("could not revoke etcd lease %d of unbound ip %v, records linger until it expires: %v",
 			b.leasedNic.Lease, b.ip, err)
 	}
 
 	return nil
 }
 
-// revokeLease returns ip to the free pool, but only if nic actually holds it.
-// The caller is expected to pass the address the client named itself rather
-// than whatever the nic happens to be holding, so that a client can only ever
-// give up a lease it can identify.
+// revokeLease takes ip away from nic, but only if nic actually holds it, and
+// quarantines the address instead of returning it to the free pool. The caller
+// is expected to pass the address the client named itself rather than whatever
+// the nic happens to be holding, so that a client can only ever give up a lease
+// it can identify -- and, since the address is then withheld from everyone,
+// so that a forged DECLINE cannot take somebody else's address out of
+// circulation.
 //
 // This is what a DECLINE does. A RELEASE goes through releaseLease, which
 // makes the same check and then some.
+//
+// A client declines an address when it finds another host already answering
+// ARP for it, and RFC 2131 4.3.3 has the server mark such an address as not
+// available. Putting it straight back into the free pool, as this used to do,
+// made it the lowest free address again, so the very next DISCOVER was
+// offered it: on 2026-10-10 one client declined 192.168.3.106 47 times in two
+// hours, and on 2026-10-11 two clients declined .116 55 times between them,
+// each time because a Shelly was still using an address whose binding had been
+// freed underneath it.
+//
+// So the address goes under ips/declined instead, on an etcd lease of its own
+// that runs for DeclineProbation, with the declining nic as the value for
+// whoever comes looking. bootstrapLeasableRange and resurrectLeases leave
+// declined addresses alone, so it is the expiry of that lease that hands the
+// address back to resurrectLeases, which then returns it to the pool like any
+// other expired one.
+//
+// A node running a version from before quarantine sees a declined address as
+// being in neither the free nor the leased set, exactly like an expired one,
+// and its resurrectLeases puts it back in the pool within 10s. Until every
+// node is upgraded a quarantine only lasts as long as no old node looks.
 func (p *PluginState) revokeLease(ctx context.Context, nic net.HardwareAddr, ip net.IP) error {
 	b, err := p.readBinding(ctx, nic, ip)
 	if err != nil {
@@ -437,12 +502,49 @@ func (p *PluginState) revokeLease(ctx context.Context, nic net.HardwareAddr, ip 
 		return fmt.Errorf("nic %v does not hold a lease on %v: %w", nic, ip, ErrNotLeased)
 	}
 
-	return p.unbind(ctx, b)
+	return p.quarantine(ctx, b)
 }
 
-// releaseLease is revokeLease for a RELEASE addressed to server, which on top
-// of naming the right address has to be about the binding as it stands rather
-// than one that came before it.
+// quarantine is unbind for a declined binding: the address is held back from
+// the free pool for DeclineProbation rather than returned to it.
+func (p *PluginState) quarantine(ctx context.Context, b binding) error {
+	lessor := etcd.NewLease(p.client)
+
+	probation, err := lessor.Grant(ctx, int64(p.config.DeclineProbation.Seconds()))
+	if err != nil {
+		return errors.Wrap(err, "could not create probation lease")
+	}
+
+	// as in leaseIP, the lease is granted before we know whether we get to use
+	// it, and has to be handed back if we don't
+	quarantined := false
+	defer func() {
+		if quarantined {
+			return
+		}
+
+		ctx, cancel := context.WithTimeout(context.WithoutCancel(ctx), time.Second)
+		defer cancel()
+
+		if _, err := lessor.Revoke(ctx, probation.ID); err != nil {
+			log.Debugf("could not revoke unused probation lease %d: %v", probation.ID, err)
+		}
+	}()
+
+	if err := p.unbind(ctx, b,
+		etcd.OpPut(b.declinedIPKey, b.nic.String(), etcd.WithLease(probation.ID))); err != nil {
+		return err
+	}
+
+	quarantined = true
+
+	return nil
+}
+
+// releaseLease is revokeLease for a RELEASE addressed to server. The address
+// goes back into the free pool rather than into quarantine, and on top of
+// naming the right address the RELEASE has to be about the binding as it
+// stands rather than one that came before it.
 //
 // Some clients bring a new DHCP session up before tearing the old one down,
 // and the old session's parting RELEASE names its own address and its own
@@ -496,5 +598,5 @@ func (p *PluginState) releaseLease(ctx context.Context, nic net.HardwareAddr, ip
 		}
 	}
 
-	return p.unbind(ctx, b)
+	return p.unbind(ctx, b, etcd.OpPut(b.freeIPKey, b.ip.String()))
 }

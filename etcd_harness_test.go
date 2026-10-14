@@ -90,13 +90,14 @@ func newTestPlugin(t *testing.T, start, end string) *PluginState {
 
 	return &PluginState{
 		config: Config{
-			Prefix:       t.Name(),
-			Separator:    constDefaultSeparator,
-			MinLeaseTime: constDefaultMinLeaseTime,
-			MaxLeaseTime: constDefaultMaxLeaseTime,
-			ReleaseGrace: constDefaultReleaseGrace,
-			DNSPrefix:    t.Name() + "-dns",
-			DNSZone:      "example.test",
+			Prefix:           t.Name(),
+			Separator:        constDefaultSeparator,
+			MinLeaseTime:     constDefaultMinLeaseTime,
+			MaxLeaseTime:     constDefaultMaxLeaseTime,
+			ReleaseGrace:     constDefaultReleaseGrace,
+			DeclineProbation: constDefaultDeclineProbation,
+			DNSPrefix:        t.Name() + "-dns",
+			DNSZone:          "example.test",
 		},
 		client:    testClient,
 		allocator: allocator,
@@ -122,6 +123,11 @@ func bootstrapped(t *testing.T, start, end string) *PluginState {
 func (p *PluginState) freeKey(ip string) string {
 	return p.config.Prefix + p.config.Separator + "ips" + p.config.Separator +
 		"free" + p.config.Separator + ip
+}
+
+func (p *PluginState) declinedKey(ip string) string {
+	return p.config.Prefix + p.config.Separator + "ips" + p.config.Separator +
+		"declined" + p.config.Separator + ip
 }
 
 func (p *PluginState) leasedIPKey(ip string) string {

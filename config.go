@@ -25,6 +25,9 @@ type Config struct {
 	// leftover from before the grant rather than about the grant itself, see
 	// releaseLease
 	ReleaseGrace time.Duration
+	// how long an address a client has declined is kept out of the free pool,
+	// see revokeLease
+	DeclineProbation time.Duration
 }
 
 // clampLeaseTime bounds a lease time to the configured range
@@ -39,7 +42,7 @@ func (c Config) clampLeaseTime(d time.Duration) time.Duration {
 }
 
 func (c Config) String() string {
-	return fmt.Sprintf("CA=%s Cert=%s Key=%s Endpoints=%v Start=%s End=%s Prefix=%s Separator=%s DNSZone=%s DNSPrefix=%s DNSNames=%s MinLeaseTime=%s MaxLeaseTime=%s ReleaseGrace=%s",
+	return fmt.Sprintf("CA=%s Cert=%s Key=%s Endpoints=%v Start=%s End=%s Prefix=%s Separator=%s DNSZone=%s DNSPrefix=%s DNSNames=%s MinLeaseTime=%s MaxLeaseTime=%s ReleaseGrace=%s DeclineProbation=%s",
 		c.CA, c.Cert, c.Key, c.Endpoints, c.Start, c.End, c.Prefix, c.Separator, c.DNSZone, c.DNSPrefix, c.DNSNames,
-		c.MinLeaseTime, c.MaxLeaseTime, c.ReleaseGrace)
+		c.MinLeaseTime, c.MaxLeaseTime, c.ReleaseGrace, c.DeclineProbation)
 }
