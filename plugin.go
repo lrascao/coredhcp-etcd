@@ -48,6 +48,16 @@ const (
 	// address stays with the same client until it expires -- so the margin is
 	// deliberately wide.
 	constDefaultReleaseGrace = 30 * time.Second
+
+	// how soon after another server grants a binding a REQUEST without a server
+	// identifier is taken to be the same broadcast that server answered, see
+	// renewLease. The copies of one broadcast reach every server within
+	// milliseconds of each other, and the margin is for the time a grant spends
+	// between being stamped and being committed when etcd is slow. A client
+	// that gets no answer retransmits after about 4s and again after about 12s
+	// (RFC 2131 §4.1), so if the server that won crashes before answering, the
+	// client is answered by the second retransmission at the latest.
+	constAnsweredWindow = 5 * time.Second
 )
 
 // PluginState is the data held by an instance of the range plugin
@@ -110,24 +120,13 @@ func (p *PluginState) Handler4(req, resp *dhcpv4.DHCPv4) (*dhcpv4.DHCPv4, bool) 
 	case dhcpv4.MessageTypeRequest:
 		reqServerIP := req.ServerIdentifier()
 
-		// deny REQUESTs without a server identifier
-		if reqServerIP == nil {
-			log.Errorf("no server identifier in DHCP request, returning negative reply")
-			resp.UpdateOption(dhcpv4.OptMessageType(dhcpv4.MessageTypeNak))
-			return resp, false
-		}
-
-		// is the message meant for this server?
-		if !reqServerIP.Equal(resp.ServerIPAddr) {
+		// is the message meant for this server? One without a server
+		// identifier is a client holding on to the address it has rather than
+		// choosing between offers, see confirm
+		if reqServerIP != nil && !reqServerIP.Equal(resp.ServerIPAddr) {
 			// ignore
 			log.Debugf("ignoring DHCP request meant for %s", reqServerIP)
 			return nil, true
-		}
-
-		// prefer renewing leases
-		ip := req.ClientIPAddr
-		if req.RequestedIPAddress() != nil {
-			ip = req.RequestedIPAddress()
 		}
 
 		leaseTime := resp.IPAddressLeaseTime(constDefaultLeaseTime)
@@ -149,6 +148,16 @@ func (p *PluginState) Handler4(req, resp *dhcpv4.DHCPv4) (*dhcpv4.DHCPv4, bool) 
 		// it's what the reply has to advertise
 		if resp.IPAddressLeaseTime(constDefaultLeaseTime) != leaseTime {
 			resp.UpdateOption(dhcpv4.OptIPAddressLeaseTime(leaseTime))
+		}
+
+		if reqServerIP == nil {
+			return p.confirm(ctx, req, resp, leaseTime)
+		}
+
+		// prefer renewing leases
+		ip := req.ClientIPAddr
+		if req.RequestedIPAddress() != nil {
+			ip = req.RequestedIPAddress()
 		}
 
 		// lease the IP in etcd, as granted by this server
@@ -238,6 +247,83 @@ func (p *PluginState) Handler4(req, resp *dhcpv4.DHCPv4) (*dhcpv4.DHCPv4, bool) 
 	default:
 		log.Errorf("unhandled DHCPv4 packet %v (%s): ", req.MessageType(), req.Summary())
 	}
+
+	return resp, false
+}
+
+// confirm answers a REQUEST that carries no server identifier. RFC 2131
+// §4.3.2 has a client leave option 54 out whenever it is holding on to an
+// address it was already given, rather than taking one from an offer:
+//
+//   - INIT-REBOOT, after a reboot or a reconnect: the address in option 50,
+//     ciaddr zero, broadcast
+//   - RENEWING, from T1: the address in ciaddr, unicast to the server that
+//     granted it
+//   - REBINDING, from T2 when renewing got no answer: the address in ciaddr,
+//     broadcast
+//
+// All three get an ACK that renews the binding when the address is the one the
+// client holds, and a NAK when it names one the client does not hold, so that
+// it stops using it and starts over. The exception is an INIT-REBOOT from a
+// client there is no binding for at all, which gets no answer: the RFC says the
+// server MUST remain silent, and the client falls back to DISCOVER on its own.
+// RENEWING and REBINDING look the same from here, they only differ in where the
+// packet was sent, and renewLease makes sure that only one server answers the
+// broadcast ones.
+func (p *PluginState) confirm(ctx context.Context, req, resp *dhcpv4.DHCPv4, leaseTime time.Duration) (*dhcpv4.DHCPv4, bool) {
+	// RENEWING and REBINDING must leave option 50 out, and INIT-REBOOT must
+	// leave ciaddr zero. A client that fills both in anyway is held to ciaddr,
+	// the address it is actually using and the one the reply goes to
+	ip, initReboot := req.ClientIPAddr, false
+	if ip == nil || ip.IsUnspecified() {
+		ip, initReboot = req.RequestedIPAddress(), true
+	}
+	if ip == nil || ip.IsUnspecified() {
+		log.Errorf("DHCP request from %s names neither a server nor an address, returning negative reply",
+			req.ClientHWAddr)
+		resp.UpdateOption(dhcpv4.OptMessageType(dhcpv4.MessageTypeNak))
+		return resp, false
+	}
+
+	leaseID, previous, err := p.renewLease(ctx, req.ClientHWAddr, ip, leaseTime, resp.ServerIPAddr)
+	if err != nil {
+		switch {
+		case initReboot && IsNoBinding(err):
+			log.Infof("staying silent on DHCP request from %s for %s, it has no binding: %v",
+				req.ClientHWAddr, ip, err)
+			return nil, true
+		case IsNoBinding(err), IsNotLeased(err):
+			log.Infof("DHCP request from %s for %s refused, returning negative reply: %v",
+				req.ClientHWAddr, ip, err)
+			resp.UpdateOption(dhcpv4.OptMessageType(dhcpv4.MessageTypeNak))
+			return resp, false
+		case IsAnswered(err):
+			log.Debugf("leaving DHCP request from %s for %s to the server that answered it: %v",
+				req.ClientHWAddr, ip, err)
+			return nil, true
+		default:
+			log.Errorf("unable to renew nic %s, ip %s: %v", req.ClientHWAddr, ip, err)
+			return nil, true
+		}
+	}
+
+	resp.YourIPAddr = ip
+
+	// the records go wherever the binding went, either written afresh under the
+	// name the client gives now or carried over from the lease it was renewed
+	// from when it gives none
+	if hostname := req.HostName(); hostname != "" {
+		if err := p.dns.Register(ctx, p.client, hostname, ip, req.ClientHWAddr,
+			leaseID); err != nil {
+			log.Errorf("unable to register DNS name %s for ip %s: %v", hostname, ip, err)
+			return nil, true
+		}
+	} else if err := p.carryOver(ctx, previous, leaseID); err != nil {
+		// the binding is renewed regardless, the records only lapse early
+		log.Errorf("unable to carry the DNS records of %s over to its renewed lease: %v", ip, err)
+	}
+
+	log.Infof("renewed %s for %s", ip, req.ClientHWAddr)
 
 	return resp, false
 }

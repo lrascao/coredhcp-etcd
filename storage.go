@@ -305,6 +305,148 @@ func (p *PluginState) leaseIP(ctx context.Context, nic net.HardwareAddr, ip net.
 	return lease.ID, nil
 }
 
+// renewLease is leaseIP for a REQUEST that names no server, see confirm. The
+// client is not asking for an address but holding on to one it was given, so
+// nothing comes out of the free pool: nic has to hold ip already, and the
+// binding moves onto a fresh etcd lease of ttl with a grant naming server. It
+// returns that lease, and the one the binding was renewed from.
+//
+// It fails with ErrNoBinding when there is no binding for nic at all, and with
+// ErrNotLeased when nic holds some other address or ip is somebody else's.
+//
+// A REQUEST without a server identifier is broadcast in INIT-REBOOT and
+// REBINDING, so every server sharing these bindings gets a copy, and every one
+// of them could vouch for it. Only one does. The renewal only goes in if the
+// binding is still as it was read, so of the servers that read it together
+// just one gets its renewal in, and the others read it again to find out why.
+// A server that finds the binding granted by another one within
+// constAnsweredWindow takes it to be that server answering this same
+// broadcast, and backs off with ErrAnswered. The client gets a single ACK, and
+// the grant names the server that sent it, which is the one its unicast
+// renewals and its RELEASE go to. releaseLease depends on that, and with every
+// server answering, the grant would name whichever renewal landed last rather
+// than the ACK the client took.
+//
+// Unlike releaseLease, this compares a grant's timestamp against this node's
+// clock when another node wrote it. Here that only ever decides who answers:
+// two nodes further apart than the window can both answer one broadcast, which
+// costs the client a duplicate ACK, and it never decides whether a binding
+// survives.
+func (p *PluginState) renewLease(ctx context.Context, nic net.HardwareAddr, ip net.IP, ttl time.Duration, server net.IP) (etcd.LeaseID, etcd.LeaseID, error) {
+	kvc := etcd.NewKV(p.client)
+	lessor := etcd.NewLease(p.client)
+
+	granted, err := json.Marshal(grant{Server: server.String(), Time: time.Now().UTC()})
+	if err != nil {
+		return 0, 0, errors.Wrap(err, "could not encode grant")
+	}
+
+	lease, err := lessor.Grant(ctx, int64(ttl.Seconds()))
+	if err != nil {
+		return 0, 0, errors.Wrap(err, "could not create new lease")
+	}
+
+	// as in leaseIP, hand the lease back on every path that doesn't end up
+	// attaching the binding to it
+	attached := false
+	defer func() {
+		if attached {
+			return
+		}
+
+		ctx, cancel := context.WithTimeout(context.WithoutCancel(ctx), time.Second)
+		defer cancel()
+
+		if _, err := lessor.Revoke(ctx, lease.ID); err != nil {
+			log.Debugf("could not revoke unused lease %d: %v", lease.ID, err)
+		}
+	}()
+
+	// an attempt only fails because the binding changed after it was read, and
+	// the next read finds out how
+	for attempt := 0; attempt < 3; attempt++ {
+		b, err := p.readBinding(ctx, nic, ip)
+		if err != nil {
+			return 0, 0, err
+		}
+
+		if b.leasedNic == nil {
+			return 0, 0, fmt.Errorf("there is no binding for nic %v: %w", nic, ErrNoBinding)
+		}
+		if !b.held() {
+			return 0, 0, fmt.Errorf("nic %v does not hold a lease on %v: %w", nic, ip, ErrNotLeased)
+		}
+
+		if g, ok := b.granted(); ok && g.Server != server.String() {
+			if age := time.Since(g.Time); age > -constAnsweredWindow && age < constAnsweredWindow {
+				return 0, 0, fmt.Errorf("%v on %v was granted by %s %v ago: %w",
+					nic, ip, g.Server, age.Round(time.Millisecond), ErrAnswered)
+			}
+		}
+
+		res, err := kvc.Txn(ctx).If(
+			etcd.Compare(etcd.ModRevision(b.leasedNicKey), "=", b.leasedNic.ModRevision),
+			etcd.Compare(etcd.ModRevision(b.leasedIPKey), "=", b.leasedIP.ModRevision),
+		).Then(
+			etcd.OpPut(b.leasedNicKey, ip.String(), etcd.WithLease(lease.ID)),
+			etcd.OpPut(b.leasedIPKey, nic.String(), etcd.WithLease(lease.ID)),
+			etcd.OpPut(b.grantedNicKey, string(granted), etcd.WithLease(lease.ID)),
+		).Commit()
+		if err != nil {
+			return 0, 0, errors.Wrap(err, "could not renew lease")
+		}
+
+		if res.Succeeded {
+			attached = true
+			return lease.ID, etcd.LeaseID(b.leasedNic.Lease), nil
+		}
+	}
+
+	return 0, 0, fmt.Errorf("binding of nic %v on %v kept changing while it was being renewed", nic, ip)
+}
+
+// carryOver moves whatever is still on the etcd lease a binding was renewed
+// from onto the lease it was renewed to. That is the DNS records. Register puts
+// them on the binding's lease so that they live and die with it, but only when
+// the client sends its hostname, and a renewal without one would leave them to
+// expire with the old lease while the binding carries on. A key only moves if
+// nothing has rewritten it since it was read, so a name that another client
+// has registered over in the meantime stays theirs.
+func (p *PluginState) carryOver(ctx context.Context, from, to etcd.LeaseID) error {
+	if from == 0 || from == to {
+		return nil
+	}
+
+	kvc := etcd.NewKV(p.client)
+
+	// an old lease that has already expired comes back with no keys
+	ttl, err := etcd.NewLease(p.client).TimeToLive(ctx, from, etcd.WithAttachedKeys())
+	if err != nil {
+		return errors.Wrap(err, "could not list the keys of the previous lease")
+	}
+
+	for _, key := range ttl.Keys {
+		res, err := kvc.Get(ctx, string(key))
+		if err != nil {
+			return errors.Wrapf(err, "could not read %s", key)
+		}
+		if len(res.Kvs) == 0 || etcd.LeaseID(res.Kvs[0].Lease) != from {
+			continue
+		}
+		kv := res.Kvs[0]
+
+		if _, err := kvc.Txn(ctx).If(
+			etcd.Compare(etcd.ModRevision(string(key)), "=", kv.ModRevision),
+		).Then(
+			etcd.OpPut(string(key), string(kv.Value), etcd.WithLease(to)),
+		).Commit(); err != nil {
+			return errors.Wrapf(err, "could not move %s", key)
+		}
+	}
+
+	return nil
+}
+
 func (p *PluginState) freeIP(ctx context.Context) (net.IP, error) {
 	kvc := etcd.NewKV(p.client)
 
